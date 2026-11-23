@@ -1,0 +1,58 @@
+/* The landing page: a storybook-cartoon look, thick ink outlines, gold and a deep violet night. */
+:root{--ink:#1b1426;--paper:#fff8ea;--gold:#ffc83d;--gold-dark:#c98a00;--violet:#151021;--violet-2:#251a3a;--text:#f6efff;--muted:#c9bddf;color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--violet);color:var(--text);font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+body.is-playing{overflow:hidden}
+img{max-width:100%}
+a{color:var(--gold)}
+button{font:inherit;cursor:pointer;touch-action:manipulation}
+:focus-visible{outline:3px solid var(--gold);outline-offset:3px}
+
+.cs-top{position:absolute;inset:0 0 auto;z-index:2;display:flex;justify-content:space-between;align-items:center;padding:max(12px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) 12px max(16px,env(safe-area-inset-left))}
+.cs-brand{display:flex;align-items:center;gap:8px;color:#fff;text-decoration:none;font-weight:900;letter-spacing:.02em;text-shadow:0 2px 0 var(--ink)}
+.cs-brand img{width:32px;height:32px;filter:drop-shadow(0 2px 0 var(--ink))}
+.cs-lang{display:flex;gap:4px;background:#0008;border:2px solid var(--ink);border-radius:999px;padding:3px}
+.cs-lang button{border:0;border-radius:999px;background:transparent;color:#fff;font-weight:800;font-size:13px;padding:6px 11px;min-height:32px}
+.cs-lang button[aria-pressed="true"]{background:var(--gold);color:var(--ink)}
+
+.cs-hero{position:relative;min-height:min(100svh,820px);display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:96px 16px 0;overflow:hidden;
+  background:linear-gradient(180deg,#15102166 0%,#1510211a 40%,#151021 100%),url(/images/game/siege/map-worlds.webp) center/cover no-repeat}
+.cs-hero-inner{position:relative;z-index:1;max-width:760px}
+.cs-logo{margin:0;font:900 clamp(52px,12vw,124px)/.9 "Arial Black",Impact,system-ui,sans-serif;letter-spacing:-.01em;color:var(--paper);text-transform:uppercase;
+  -webkit-text-stroke:clamp(2px,.6vw,5px) var(--ink);paint-order:stroke fill;text-shadow:0 clamp(4px,1vw,9px) 0 var(--ink)}
+.cs-logo span{display:block;color:var(--gold);transform:rotate(-2deg)}
+.cs-tagline{margin:18px auto 26px;font-size:clamp(18px,2.6vw,24px);font-weight:800;color:#fff;text-shadow:0 2px 0 var(--ink),0 0 18px #000c}
+.cs-play{border:3px solid var(--ink);border-radius:18px;background:linear-gradient(#ffe07a,var(--gold) 55%,var(--gold-dark));color:var(--ink);font-weight:900;font-size:clamp(20px,3vw,26px);text-transform:uppercase;letter-spacing:.04em;padding:14px 40px;min-height:60px;box-shadow:0 6px 0 var(--ink);transition:transform .08s,box-shadow .08s}
+.cs-play:hover{transform:translateY(-2px);box-shadow:0 8px 0 var(--ink)}
+.cs-play:active{transform:translateY(4px);box-shadow:0 2px 0 var(--ink)}
+.cs-free{margin:14px 0 0;font-size:14px;font-weight:700;color:#fff;text-shadow:0 1px 0 var(--ink),0 0 10px #000}
+.cs-troops{list-style:none;margin:28px 0 0;padding:0;display:flex;justify-content:center;align-items:flex-end;gap:clamp(0px,2vw,24px);width:100%;max-width:1000px}
+.cs-troops li{flex:1 1 0;min-width:0;display:flex;justify-content:center}
+.cs-troops img{height:clamp(70px,16vw,170px);width:auto;object-fit:contain;filter:drop-shadow(0 6px 6px #000a);animation:cs-bob 2.4s ease-in-out infinite}
+.cs-troops li:nth-child(2) img{animation-delay:-.6s}.cs-troops li:nth-child(3) img{animation-delay:-1.2s}.cs-troops li:nth-child(4) img{animation-delay:-1.8s}
+.cs-troops .is-foe img{transform:scaleX(-1)}
+@keyframes cs-bob{50%{translate:0 -6px}}
+
+.cs-section{max-width:1080px;margin:0 auto;padding:32px 16px 56px}
+.cs-lead{max-width:720px;margin:0 auto 32px;text-align:center;font-size:clamp(17px,2.2vw,20px);color:var(--muted)}
+.cs-section h2{margin:40px 0 18px;text-align:center;font:900 clamp(26px,4vw,38px)/1.1 "Arial Black",system-ui,sans-serif;color:var(--gold);-webkit-text-stroke:1.5px var(--ink);paint-order:stroke fill;text-shadow:0 3px 0 var(--ink)}
+.cs-features{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.cs-features article{background:var(--paper);color:var(--ink);border:3px solid var(--ink);border-radius:20px;box-shadow:0 6px 0 var(--ink);padding:14px 16px 18px;min-width:0}
+.cs-features img{display:block;width:100%;height:140px;object-fit:cover;border-radius:12px;border:2px solid var(--ink);background:#e8f3ff}
+.cs-features img.is-unit{object-fit:contain;background:radial-gradient(circle at 50% 60%,#ffe9b0,#ffd36b)}
+.cs-features h3{margin:12px 0 4px;font-size:19px;font-weight:900}
+.cs-features p{margin:0;font-size:15px;color:#4a3d5c}
+.cs-how{counter-reset:step;list-style:none;margin:0 auto;padding:0;max-width:720px;display:grid;gap:12px}
+.cs-how li{counter-increment:step;display:flex;gap:14px;align-items:center;background:var(--violet-2);border:2px solid #3d2d5c;border-radius:16px;padding:12px 16px}
+.cs-how li::before{content:counter(step);flex:none;display:grid;place-items:center;width:38px;height:38px;border-radius:50%;background:var(--gold);color:var(--ink);border:2px solid var(--ink);font-weight:900}
+.cs-again{text-align:center;margin:36px 0 0}
+
+.cs-foot{display:flex;flex-wrap:wrap;gap:8px 20px;justify-content:center;padding:20px 16px max(20px,env(safe-area-inset-bottom));border-top:1px solid #2d2142;color:var(--muted);font-size:13px;text-align:center}
+
+/* The privacy page. */
+.cs-doc{max-width:760px;margin:0 auto;padding:88px 16px 48px}
+.cs-doc h1{font:900 clamp(30px,5vw,44px)/1.1 "Arial Black",system-ui,sans-serif;color:var(--gold)}
+.cs-doc p,.cs-doc li{color:var(--muted)}
+
+@media (prefers-reduced-motion:reduce){.cs-troops img{animation:none}.cs-play{transition:none}}

@@ -1,0 +1,1075 @@
+import './siege.css';
+import { storage } from '../lib/storage';
+import type { Key, T } from '../strings';
+import * as cartoonModel from './cartoon/model';
+import * as cartoonView from './cartoon/view';
+import type { Camera } from './cartoon/view';
+import type { Progress, Siege } from './cartoon/model';
+import { openDuel, type DuelLink, type DuelMsg } from './duel';
+import { GAME_VERSION } from '../version';
+import * as cartoonStory from './cartoon/story';
+/** The game's mode: Cartoon Siege's campaign (its engine and save). */
+type Mode = 'cartoon';
+const ENGINES = {
+  cartoon: { m: cartoonModel, v: cartoonView },
+};
+/** The map's island pictures, world by world, and the workshop's pictures, upgrade by upgrade (army, fortress, energy, bow). */
+/** Field units a second the landing spot moves with the stick pushed all the way. */
+const AIM_SPEED = 650;
+/** Cartoon's army and generator rows have a picture for each of their five levels. */
+const ARMY_PICS = ['items/bandana', 'items/gladHelm', 'items/plate', 'items/crown', 'items/phoenix'], GENERATOR_PICS = ['items/potion', 'items/lantern', 'items/hourglass', 'items/orb', 'ui/orb'];
+/** A workshop row's picture: the fortress and the crossbow show the look their level gives (`looksTier`). */
+const upgradePic = (_mode: Mode, i: number, level: number) => (i === 1 ? `siege/castle-${cartoonModel.castleTier(level)}` : i === 3 ? `siege/units/bolt-${cartoonModel.looksTier(level)}` : i === 4 ? `siege/xbow-${cartoonModel.looksTier(level)}` : i === 5 ? 'items/quiver' : i === 6 ? 'siege/mana' : i === 0 ? ARMY_PICS[Math.min(5, Math.max(1, level)) - 1] : GENERATOR_PICS[Math.min(5, Math.max(1, level)) - 1]);
+
+/** A bar button's picture and caption: the picture made once, only the caption's text changed after (ten times a
+    second, so no `<img>` is re-created each time). */
+function setPicButton(b: HTMLButtonElement, src: string, caption: string, recharge = 0) {
+  if (!b.firstElementChild) b.innerHTML = '<img alt=""><i class="sg-cooldown" aria-hidden="true"></i><small></small>';
+  // The recharge darkens the button from the bottom, lightening from the top down as it goes (the share left, 0 to 1).
+  (b.querySelector('.sg-cooldown') as HTMLElement | null)?.style.setProperty('--cd', `${(Math.max(0, Math.min(1, recharge)) * 100).toFixed(1)}%`);
+  const img = b.firstElementChild as HTMLImageElement;
+  if (img.getAttribute('src') !== src) img.src = src;
+  const small = b.lastElementChild as HTMLElement;
+  if (small.textContent !== caption) small.textContent = caption;
+}
+const clock = (n: number) => `${Math.floor(n / 60)}:${String(Math.floor(n % 60)).padStart(2, '0')}`;
+let closeActive: (() => void) | undefined;
+/** Own root, event lifecycle and save: existing game modes are never entered or mutated. */
+/** `hero`: the player's hero picture and name, the commander who speaks in the story scenes. */
+/** `music`: Siege Cartoon's songs, its menus' or its battles', or null to go back to the player's pick. */
+export function openSiege(t: T, onClose: () => void, hero = { pic: '', name: '' }, sound: (name: string, vol?: number, pan?: number) => void = () => {}, music: (song: 'menu' | 'battle' | 'boss' | 'villain-menu' | 'villain' | null) => void = () => {}, volumes: { get: () => [number, number]; set: (music: number, sfx: number) => void; lang?: () => string; setLang?: (lang: 'es' | 'en') => T } = { get: () => [1, 1], set: () => {} }) {
+  closeActive?.();
+  /** The mode being played (null on the mode screen), its engine and its save. */
+  let mode: Mode | null = null, M = ENGINES.cartoon.m, V = ENGINES.cartoon.v;
+  let progress: Progress = M.freshProgress();
+  let selected: number[] = [], world = 1;
+  let state: Siege | null = null, paused = false, finished = false;
+  // Local checks: the battle's state, read and nudged by test scripts.
+  if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) Object.defineProperty(window, 'cartoonSiege', { get: () => state, configurable: true });
+  let frame = 0, last = 0, accumulator = 0, uiAt = 0, bossTalked = false, bossHalf = false, baseFell = false, lootHeard = 0, gustShown = false;
+  /** How far the aim stick is pushed, -1 (down, nearer) to 1 (up, further); 0 at rest. */
+  let aimPush = 0;
+  /** The bottom bar's tab, the L · A · S tabs: land troops, air troops, special powers. */
+  let tab: 'land' | 'air' | 'special' = 'land';
+  /** Army cards: a troop at a level (`id + (level - 1) * 100`). */
+  const cid = (c: number) => c % 100, clv = (c: number) => Math.floor(c / 100) + 1;
+  const air = (c: number) => !!M.UNITS[cid(c)].air;
+  const tabCards = () => tab === 'special' ? [] : selected.filter(id => air(id) === (tab === 'air'));
+  const camera: Camera = { x: 0, width: 650 };
+  /** When each troop sound last played (ms): the same sound at most every 140 ms, and one sound every 55 ms at most
+      (about eighteen a second), none far off screen, so a big battle stays a clash of distinct blows and the music, made
+      live on the same audio thread, never stutters under hundreds of sounds a second. */
+  const heard = new Map<string, number>(); let lastSound = -1e9;
+  function troopSounds(now: number) {
+    const q = state?.sounds; if (!q?.length) return;
+    for (const { k, x } of q.splice(0)) {
+      const mid = camera.x + camera.width / 2, off = Math.abs(x - mid) / (camera.width / 2);
+      if (off > 1.6 || now - lastSound < 55 || now - (heard.get(k) ?? -1e9) < 140) continue;
+      heard.set(k, now); lastSound = now;
+      // Louder and centred where the camera looks, softer off screen, panned left or right by its place.
+      sound(k, off <= 1 ? 1 - off * 0.25 : Math.max(0.15, 0.6 - (off - 1) * 0.5), Math.max(-1, Math.min(1, (x - mid) / (camera.width / 2))) * 0.7);
+    }
+  }
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  /** What the battle bar showed last frame: the gold, a full energy, each card ready; a change sets off its flourish. */
+  let shownGold = -1, wasFull = false; const ready: Record<number, boolean> = {};
+  const previousFocus = document.activeElement as HTMLElement | null;
+  const root = document.createElement('section'); root.className = 'siege-root'; root.setAttribute('role', 'dialog'); root.setAttribute('aria-modal', 'true'); root.setAttribute('aria-label', t('siegeName'));
+  const siblings = [...document.body.children].filter((el): el is HTMLElement => el instanceof HTMLElement).map(el => ({ el, inert: el.inert }));
+  siblings.forEach(({ el }) => el.inert = true);
+  document.body.append(root);
+  let battleAbort = new AbortController();
+  const abort = new AbortController(); const options = { signal: abort.signal };
+  const q = <E extends HTMLElement>(selector: string) => root.querySelector<E>(selector)!;
+  /** The Villain campaign (opened by winning the hero's last battle): its own save, the enemy's troops against ours. */
+  let villain = false;
+  const persist = () => { storage.set(villain ? cartoonModel.VILLAIN_KEY : M.SAVE_KEY, JSON.stringify(progress)); };
+  /* A battle under way is kept (every few seconds, and the moment the page is hidden), so that when the browser throws
+     the page away (an iPhone short of memory, or the game left in the background) and loads it again, the battle can
+     go on from where it was instead of being lost. Not duels: the rival's link is gone with the page. */
+  const RESUME_KEY = 'cartoonSiege.resume';
+  type Kept = { v: string; world: number; villain: boolean; selected: number[]; at: number; state: Siege };
+  let keptAt = -1e9;
+  function keepBattle(force = false) {
+    if (mode !== 'cartoon' || duel || !state || state.phase !== 'fight' || story) return;
+    const now = performance.now(); if (!force && now - keptAt < 4000) return; keptAt = now;
+    try { storage.set(RESUME_KEY, JSON.stringify({ v: GAME_VERSION, world, villain, selected, at: Date.now(), state } satisfies Kept)); } catch { /* full or blocked: nothing kept */ }
+  }
+  const dropBattle = () => storage.set(RESUME_KEY, '');
+  /** The kept battle, if it is this version's, unfinished and from the last day. */
+  function keptBattle(): Kept | null {
+    try {
+      const k = JSON.parse(storage.get(RESUME_KEY) || 'null') as Kept | null;
+      if (!k || k.v !== GAME_VERSION || !k.state || k.state.phase !== 'fight' || !Array.isArray(k.state.units) || typeof k.world !== 'number' || Date.now() - k.at > 86400e3) return null;
+      return k;
+    } catch { return null; }
+  }
+  /** On opening the Siege: a battle left half way is offered to be carried on. */
+  function offerResume() {
+    const k = keptBattle(); if (!k || state) return;
+    modal(`<div class="sg-pausebox"><h2>${t('siegeResumeTitle')}</h2><p>${t('siegeResumeText', { n: k.world, time: clock(k.state.time) })}</p><div class="sg-kit-actions"><button class="sg-kit is-green" data-sg="resume-battle">${t('siegeResumeGo')}</button><button class="sg-kit is-red" data-sg="resume-drop">${t('siegeResumeDrop')}</button></div></div>`);
+  }
+  function resumeBattle() {
+    const k = keptBattle(); root.querySelector('.sg-overlay')?.remove();
+    if (!k) { prep(); return; }
+    useSide(k.villain); world = k.world; selected = [...k.selected];
+    start(k.state);
+  }
+  /** Has the hero's campaign been won (which opens the Villain's)? */
+  const villainOpen = () => cartoonModel.testing.free || (villain ? true : progress.victories.includes(cartoonModel.LAST)) || cartoonModel.readProgress(storage.get(cartoonModel.SAVE_KEY)).victories.includes(cartoonModel.LAST);
+  /** Switches between the hero's campaign and the Villain's, each with its own save. */
+  function switchSide() {
+    villain = !villain; root.classList.toggle('is-villain', villain);
+    progress = villain ? cartoonModel.readProgress(storage.get(cartoonModel.VILLAIN_KEY), true) : M.readProgress(storage.get(M.SAVE_KEY));
+    selected = [...progress.deck]; world = progress.unlocked; mapAct = 0; prepTab = 'map'; prep();
+  }
+  /** A duel with another player (`duel.ts`): the link, whether we made the room (and so run the battle), the
+      rival's army and name, and when the battle was last sent. */
+  let duel: { link: DuelLink; host: boolean; rival?: cartoonModel.DuelArmy; name?: string; sentAt: number; started?: boolean; done?: boolean } | null = null;
+  /** Leaves a duel (telling the rival), back to the plain game. */
+  function endDuel() { if (!duel) return; const d = duel; duel = null; root.classList.remove('is-duel'); try { d.link.send({ t: 'bye' }); } catch { /* gone */ } d.link.close(); }
+  /** Plays as the hero or the Villain, loading that side's save (a duel's joiner takes the side its rival leaves). */
+  function useSide(asVillain: boolean) {
+    if (villain === asVillain) return;
+    villain = asVillain; root.classList.toggle('is-villain', villain);
+    progress = villain ? cartoonModel.readProgress(storage.get(cartoonModel.VILLAIN_KEY), true) : M.readProgress(storage.get(M.SAVE_KEY));
+    selected = [...progress.deck];
+  }
+  /** Sends a card: in a duel we joined, to the rival who runs the battle; otherwise into ours. */
+  const summonCard = (c: number) => (duel && !duel.host ? (duel.link.send({ t: 'cmd', k: 'summon', c }), true) : !!state && M.summon(state, c));
+  const raiseGenerator = () => (duel && !duel.host ? (duel.link.send({ t: 'cmd', k: 'gen' }), true) : !!state && M.improveGenerator(state));
+  /** The duel menu: the side to play, make a room (its code to pass on) or join one by its code. */
+  function duelMenu(status = '') {
+    const side = (v: boolean) => `<button class="sg-kit ${villain === v ? 'is-gold' : 'is-blue'}" data-sg="duel-side" data-sg-v="${v ? 1 : 0}" aria-pressed="${villain === v}">${v ? `😈 ${t('siegeVillainMode')}` : `🛡️ ${t('siegeHeroMode')}`}</button>`;
+    modal(`<div class="sg-pausebox sg-duelbox"><button class="sg-round is-close" data-sg="duel-cancel" aria-label="${t('siegeCancel')}"><span aria-hidden="true">✕</span></button>
+      <h2>⚔️ ${t('siegeDuel')}</h2><p>${t('siegeDuelText')}</p>
+      ${villainOpen() ? `<div class="sg-langs" role="group" aria-label="${t('siegeDuelSide')}"><span>${t('siegeDuelSide')}</span>${side(false)}${side(true)}</div>` : ''}
+      <button class="sg-kit is-gold" data-sg="duel-host">${t('siegeDuelHost')}</button>
+      <div class="sg-duel-join"><input type="text" inputmode="text" autocapitalize="characters" maxlength="4" placeholder="ABCD" aria-label="${t('siegeDuelCode')}" data-sg-duel-code><button class="sg-kit is-blue" data-sg="duel-join">${t('siegeDuelJoin')}</button></div>
+      <p class="sg-duel-status" role="status">${status}</p></div>`);
+  }
+  const duelStatus = (text: string) => { const el = root.querySelector('.sg-duel-status'); if (el) el.textContent = text; };
+  /** What the duel's link says, both as the room's maker and as the one who joined. */
+  function duelHandlers(host: boolean) {
+    return {
+      code: (code: string) => duelStatus(t('siegeDuelWait', { code })),
+      open: () => { if (host && duel) { duelStatus(t('siegeDuelConnecting')); duel.link.send({ t: 'host', v: GAME_VERSION, villain, world, name: hero.name }); } },
+      error: () => { duelStatus(t('siegeDuelError')); if (duel) { duel.link.close(); duel = null; } },
+      close: () => { if (!duel) return; duel = null; root.classList.remove('is-duel'); if (state && state.phase === 'fight') { state.phase = 'lost'; state.paid = true; paused = true; modal(`<h2>${t('siegeDuelGone')}</h2><div class="sg-dialog-actions"><button class="sg-primary" data-sg="prep">${t('siegeLeave')}</button></div>`); } else duelStatus(t('siegeDuelGone')); },
+      msg: (m: DuelMsg) => {
+        if (!duel) return;
+        if (m.t === 'version') { duelStatus(t('siegeDuelVersion', { v: m.v })); endDuel(); return; }
+        if (m.t === 'host') {
+          // We joined: check the versions, take the other side and send our army.
+          if (m.v !== GAME_VERSION) { duel.link.send({ t: 'version', v: GAME_VERSION }); duelStatus(t('siegeDuelVersion', { v: m.v })); endDuel(); return; }
+          useSide(!m.villain); world = m.world; duel.name = m.name;
+          duel.link.send({ t: 'join', v: GAME_VERSION, army: cartoonModel.armyOf({ ...progress, deck: [...selected] }), name: hero.name }); duelStatus(t('siegeDuelConnecting'));
+        } else if (m.t === 'join' && duel.host) {
+          if (m.v !== GAME_VERSION) { duel.link.send({ t: 'version', v: GAME_VERSION }); duelStatus(t('siegeDuelVersion', { v: m.v })); endDuel(); return; }
+          duel.rival = m.army; duel.name = m.name; duel.link.send({ t: 'go' }); start();
+        } else if (m.t === 'go' && !duel.host) start();
+        else if (m.t === 'snap' && !duel.host && duel.started && !duel.done) { state = m.s; state.paid = false; if (state.phase !== 'fight') duelOutcome(); }
+        else if (m.t === 'cmd' && duel.host && state) { if (m.k === 'summon' && m.c !== undefined) cartoonModel.duelSummon(state as cartoonModel.Siege, m.c); else if (m.k === 'gen') cartoonModel.duelGenerator(state as cartoonModel.Siege); }
+      },
+    };
+  }
+  /** The end of a duel: who won, a little gold for each, back to the map. */
+  function duelOutcome() {
+    if (!state || duel?.done) return; state.paid = true; paused = true; if (duel) duel.done = true;
+    const won = state.phase === 'won', gold = won ? 120 : 40; progress.coins += gold; persist();
+    modal(`<span class="sg-eyebrow">⚔️ ${t('siegeDuel')}${duel?.name ? ` · ${duel.name}` : ''}</span><h2>${t(won ? 'siegeDuelWon' : 'siegeDuelLost')}</h2><strong>${t('siegeDuelReward', { n: gold })}</strong><div class="sg-dialog-actions"><button class="sg-primary" data-sg="prep">${t('siegeLeave')}</button></div>`);
+  }
+  /** Each act's guardian: the enemy's, or (the Villain campaign) the hero's. */
+  const guardianOf = (i: number) => (villain ? cartoonModel.HERO_GUARDIAN[i] : cartoonModel.GUARDIAN[i]);
+  const name = (id: number) => t(`siegeUnit${id}` as Key);
+  /** A troop's line in the shop: one per level (the form it describes). */
+  const role = (id: number, level = 1) => (villain && cartoonModel.memberOf(id, level) !== id ? t(`siegeRole${cartoonModel.memberOf(id, level)}L1` as Key) : roleOf(id, level));
+  const roleOf = (id: number, level = 1) => t(`siegeRole${id}L${Math.max(1, level)}` as Key);
+  const title = () => t(mode === 'cartoon' ? 'siegeCartoon' : 'siegeName');
+  /** The battle's last world or act. */
+  const lastWorld = () => M.LAST;
+  /** The act a Cartoon battle belongs to. */
+  const actNow = () => cartoonModel.actOf(world);
+  /** Cartoon's act guardians, by their own names (their pictures stand in until each has its own sheet). */
+  const actBoss = (n: number) => (villain ? name(cartoonModel.HERO_GUARDIAN[n - 1]) : t(`siegeActBoss${n}` as Key));
+  const worldName = (n: number) => (mode === 'cartoon' ? t('siegeAct', { n }) : t(`world${n}Name` as Key));
+  const focus = () => root.querySelector<HTMLElement>('.sg-overlay button, .sg-primary, .sg-play, button')?.focus();
+  function close() {
+    if (finished) return; finished = true; endDuel();
+    cancelAnimationFrame(frame); battleAbort.abort(); abort.abort(); root.remove(); siblings.forEach(({ el, inert }) => el.inert = inert);
+    closeActive = undefined; music(null); onClose(); previousFocus?.isConnected && previousFocus.focus();
+  }
+  closeActive = close;
+  /** An army card: a troop to pick, or (Cartoon) one to recruit with gold once its act is open. */
+  const armyCard = (id: number) => {
+    const u = M.UNITS[id], open = M.isOpen(progress, id), owned = M.owns(progress, id), on = selected.includes(id), price = M.troopPrice(id);
+    const lock = !open ? t(mode === 'cartoon' ? 'siegeOpensAct' : 'siegeUnlock', { n: u.unlock }) : '';
+    const attrs = !open ? 'disabled' : owned ? `data-sg-unit="${id}" aria-pressed="${on}"` : `data-sg-buy="${id}"`;
+    const stat = lock || (owned ? t('siegeStats', { cost: u.cost, hp: u.hp, damage: u.damage }) : t('siegeRecruit', { n: price }));
+    return `<button class="sg-card ${on ? 'is-selected' : ''} ${open && !owned ? 'is-recruit' : ''} ${open && !owned && progress.coins < price ? 'is-poor' : ''}" ${attrs}><span class="sg-check">${on ? '✓' : !open ? '🔒' : ''}</span><img src="${V.portrait(id, progress.levels[id])}" data-trim="${V.portrait(id, progress.levels[id])}" alt=""><strong>${name(id)}</strong><small>${role(id, progress.levels[id] ?? 1)}</small><small class="sg-stat">${stat}</small></button>`;
+  };
+  /** The preparation screen's tab: the world map, the army, or the workshop (the mode's shop); Cartoon's shop is both
+      the army and the workshop. */
+  let prepTab: 'map' | 'army' | 'shop' = 'map';
+  /** Cartoon's map: 0 shows the world map (`siege/map-worlds`), a world's number its own map of five stages
+      (`siege/map-N`). */
+  let mapAct = 0;
+  /** The owner's "everything free" testing switch, remembered on this device. */
+  const FREE_KEY = 'cartoonSiege.free';
+  cartoonModel.testing.free = storage.get(FREE_KEY) === '1';
+  /** No time limit (settings): battles end only when a base falls, remembered on this device. */
+  const UNTIMED_KEY = 'cartoonSiege.untimed';
+  cartoonModel.prefs.untimed = storage.get(UNTIMED_KEY) === '1';
+  // The view (settings): the whole field at once is offered on a wide screen with a mouse, where the troops stay legible.
+  const WIDE_KEY = 'cartoonSiege.wide', wideScreen = () => matchMedia('(min-width: 900px) and (pointer: fine)').matches;
+  V.viewPrefs.wide = storage.get(WIDE_KEY) === '1' && wideScreen();
+  // Mute all (settings): both volumes to nothing, and back to what they were (the game's defaults if they were off already).
+  let lastHeard: [number, number] = [0.6, 0.8];
+  const muted = () => volumes.get().every(v => v === 0);
+  // Tilt (phones, settings): leaning the phone left or right slides the camera, from where it was held at the start.
+  // It reads gravity itself (`devicemotion`), which tells the lean whether the phone is held flat or upright.
+  const TILT_KEY = 'cartoonSiege.tilt', touchScreen = () => matchMedia('(pointer: coarse)').matches;
+  const tiltOn = () => storage.get(TILT_KEY) !== '0';
+  let tiltBase: number | null = null, tilt = 0, tiltListening = false;
+  /** iPhones ask before giving the motion: not asked yet (null), given (true) or refused (false). */
+  let tiltGranted: boolean | null = null;
+  const TILT = { dead: 3, full: 22, speed: 900 };
+  const onTilt = (e: DeviceMotionEvent) => {
+    const g = e.accelerationIncludingGravity;
+    if (!state || paused || !tiltOn() || !g || g.x === null || g.y === null || g.z === null) { tilt = 0; return; }
+    const size = Math.hypot(g.x, g.y, g.z) || 1, angle = screen.orientation?.angle ?? 0, landscape = innerWidth > innerHeight;
+    // The share of gravity along the screen's right: held sideways that is the phone's long axis (y), upright its short one (x).
+    const right = landscape ? (g.y / size) * (angle === 270 || angle === -90 ? 1 : -1) : -g.x / size;
+    const raw = Math.asin(Math.max(-1, Math.min(1, right))) * 180 / Math.PI;
+    if (tiltBase === null) tiltBase = raw;
+    const lean = raw - tiltBase, amount = Math.max(0, Math.abs(lean) - TILT.dead) / (TILT.full - TILT.dead);
+    tilt = Math.sign(lean) * Math.min(1, amount);
+  };
+  const motionAsks = () => { const D = typeof DeviceMotionEvent !== 'undefined' ? (DeviceMotionEvent as unknown as { requestPermission?: () => Promise<string> }) : undefined; return typeof D?.requestPermission === 'function' ? D.requestPermission.bind(D) : null; };
+  const listenTilt = () => { if (tiltListening || typeof DeviceMotionEvent === 'undefined') return; tiltListening = true; tiltBase = null; window.addEventListener('devicemotion', onTilt, { signal: abort.signal }); };
+  /** Asked on a touch or tap (the browser only answers to one), once; without the asking the motion is simply listened to. */
+  const askTilt = () => {
+    if (tiltListening || !touchScreen() || !tiltOn()) return;
+    const ask = motionAsks();
+    if (!ask) { listenTilt(); return; }
+    if (tiltGranted !== null) return;
+    ask().then(r => { tiltGranted = r === 'granted'; if (tiltGranted) listenTilt(); if (root.querySelector('[data-sg="tilt"]')) settingsMenu(); }).catch(() => { tiltGranted = false; });
+  };
+  const fullscreenOn = () => !!document.fullscreenElement, canFullscreen = () => !!document.fullscreenEnabled && !!document.documentElement.requestFullscreen;
+  /** The turn-your-phone notice was closed (it stays closed on the maps). */
+  let turnSeen = false;
+  /** Where each map picture's platforms are (% of its width and height), measured on the owner's pictures: index 0 the
+      world map's six, then each world's five stages, left to right. */
+  const THREAT_ICONS: Record<string, string> = { swarm: '🐾', wall: '🛡️', sky: '🦅', shooters: '🎯', giants: '🗿' };
+  const MAP_SPOTS: [number, number][][] = [
+    [[10.5, 51.7], [31.9, 25.6], [45.8, 54.8], [61.6, 32.9], [74.9, 57.3], [92.6, 27.6]],
+    [[14.1, 39.1], [41.6, 60.9], [54.1, 51], [70, 61.6], [86.4, 48.7]],
+    [[7.8, 35.6], [28.1, 51.8], [49.9, 42.3], [69.1, 58.2], [89.4, 34.5]],
+    [[11.1, 46], [33.2, 37.7], [51.7, 51.5], [71.2, 39.9], [89.7, 28.2]],
+    [[12.6, 57.9], [32.6, 44.4], [50.2, 55.8], [68.2, 43], [86.4, 38.8]],
+    [[7.2, 32.7], [31.1, 56.9], [51.1, 44.6], [68.5, 57.9], [89.7, 38.3]],
+    [[7.8, 34], [28.7, 55.8], [47.8, 43.9], [70, 57.9], [90, 36.7]],
+  ];
+  /** Cartoon's shop: its tab (land, air or the base's upgrades) and the tile picked (a troop or upgrade, and a level). */
+  let shopTab: 'land' | 'air' | 'special' | 'base' = 'land';
+  let pick = { row: 0, level: 1 };
+  /** A tile of Cartoon's shop: owned, the next one to buy (with its price), or locked (and why). */
+  const tile = (row: number, level: number) => {
+    if (shopTab === 'special') {
+      const now = progress.powers[row] ?? 0, open = cartoonModel.isPowerOpen(progress, row);
+      return { have: level <= now, next: open && level === now + 1, price: cartoonModel.powerCost(row, level), why: !open ? t('siegeOpensAct', { n: cartoonModel.POWERS[row].unlock }) : t('siegeBuyFirst') };
+    }
+    if (shopTab === 'base') {
+      const have = progress.upgrades[row];
+      return { have: level <= have, next: level === have + 1, price: M.upgradePrice(level - 1), why: t('siegeBuyFirst') };
+    }
+    const owned = M.owns(progress, row), now = progress.levels[row] ?? 1, open = M.isOpen(progress, row);
+    const formOk = mode !== 'cartoon' || cartoonModel.formOpen(progress, row, level), next = open && formOk && (owned ? level === now + 1 : level === 1);
+    return { have: owned && level <= now, next, price: level === 1 || (mode === 'cartoon' && cartoonModel.testing.free) ? M.troopPrice(row) : (mode === 'cartoon' && villain ? cartoonModel.troopPrice(cartoonModel.memberOf(row, level)) : M.UNITS[row].forms?.[level - 2]?.price ?? 0), why: !open || !formOk ? (M.UNITS[row].legend ? t('siegeOpensLegend') : (villain && row === cartoonModel.GUARDIAN[0] ? t('siegeOpensBoss', { n: level }) : t('siegeOpensAct', { n: villain ? cartoonModel.lineAct(row, level) : M.UNITS[row].unlock }))) : t('siegeBuyFirst') };
+  };
+  /** A special power's picture at a form (the shop's tiles and the battle bar's buttons), under /images/game/. */
+  /** Each power form's icon: the owner's drawn badges (`siege/powers/power-<power>-<form>`), their rim richer per form. */
+  const POWER_PICS = cartoonModel.POWERS.map((w, r) => w.forms.map((_, f) => `siege/powers/power-${r}-${f + 1}`));
+  const powerPic = (row: number, level: number) => `/images/game/${POWER_PICS[row][Math.min(level, POWER_PICS[row].length) - 1]}.webp`;
+  /** A card dearer than the most energy a battle can hold with the shop's mana as it is (the generator at the top) says
+      how much it needs, so the player knows to raise the mana. */
+  const needMana = (cost: number) => { const most = 200 + progress.upgrades[6] * cartoonModel.MANA_STEP + 400; return cost > most ? ` · ${t('siegeNeedMana', { n: cost })}` : ''; };
+  const powerName = (row: number, level: number) => t(`siegePower${row}F${Math.min(level, cartoonModel.POWERS[row].forms.length)}` as Key);
+  const shopRows = () => (shopTab === 'special' ? cartoonModel.POWERS.map(w => w.id) : shopTab === 'base' ? BASE_ROWS : (mode === 'cartoon' ? cartoonModel.rosterOf(progress) : M.ALLIES).filter(u => !!u.air === (shopTab === 'air')).map(u => u.id));
+  const rowLevels = (row: number) => (shopTab === 'special' ? cartoonModel.POWERS[row].forms.length : shopTab === 'base' ? 5 : M.levelsOf(row));
+  /** Cartoon's shop, laid out: tabs on top, a row of tiles per troop (each form, joined, its
+      energy on it) or per upgrade, the equipped slots on the right, and below the picked tile's name, price, the gold,
+      Purchase and Equip. */
+  function cartoonShop() {
+    const rows = shopRows(); if (!rows.includes(pick.row)) pick = { row: rows[0], level: 1 };
+    const tabs = (['land', 'air', 'special', 'base'] as const).map(k => `<button role="tab" class="sg-st-tab is-${k} ${shopTab === k ? 'is-on' : ''}" aria-selected="${shopTab === k}" data-sg-shop-tab="${k}">${t(k === 'land' ? 'siegeShopLand' : k === 'air' ? 'siegeShopAir' : k === 'special' ? 'siegeShopSpecial' : 'siegeShopBase')}</button>`).join('');
+    // A legendary troop stays a «?» (even its first form) until the game is won: hidden troops, for the hype.
+    const secret = (row: number) => (shopTab === 'land' || shopTab === 'air') && !!M.UNITS[row]?.legend && !M.isOpen(progress, row);
+    // Troops come in groups: the army, then support, then the legendary ones, each after its own heading.
+    const groupHead = (row: number, i: number) => { if (shopTab !== 'land' && shopTab !== 'air') return ''; const g = cartoonModel.groupOf(M.UNITS[row]); return g && (i === 0 || cartoonModel.groupOf(M.UNITS[rows[i - 1]]) !== g) ? `<h4 class="sg-st-group is-${g === 1 ? 'support' : 'legend'}">${t(g === 4 ? 'siegeGroupBosses' : g === 3 ? 'siegeGroupChampions' : g === 2 ? 'siegeGroupLegend' : 'siegeGroupSupport')}</h4>` : ''; };
+    const grid = rows.map((row, i) => `${groupHead(row, i)}<div class="sg-st-row">${Array.from({ length: rowLevels(row) }, (_, k) => {
+      const level = k + 1, x = tile(row, level), on = pick.row === row && pick.level === level;
+      const pic = shopTab === 'special' ? powerPic(row, level) : shopTab === 'base' ? `/images/game/${upgradePic('cartoon', row, level)}.webp` : V.portrait(row, level);
+      const corner = shopTab === 'special' ? `${cartoonModel.powerMana(row, level)}` : shopTab === 'base' ? String(level) : String(M.specAt(row, level).cost);
+      const worn = shopTab === 'special' ? progress.kit.includes(cartoonModel.powerCard(row, level)) : shopTab !== 'base' && selected.includes(cartoonModel.card(row, level));
+      // What is still to come stays hidden as a «?» (only what is owned, the next one to buy, and every troop's first form show), for the hype.
+      const hidden = !x.have && !x.next && !(shopTab !== 'base' && level === 1 && !secret(row));
+      return `<button class="sg-st-tile ${x.have ? 'is-have' : x.next ? 'is-next' : 'is-locked'} ${on ? 'is-on' : ''} ${worn ? 'is-worn' : ''}" data-sg-tile="${row}:${level}" aria-pressed="${on}" aria-label="${hidden ? '?' : `${shopTab === 'special' ? powerName(row, level) : shopTab === 'base' ? t(`siegeBaseName${row}` as Key) : name(row)} · ${t('siegeLevel', { n: level })}`}">${hidden ? '<span class="sg-st-q" aria-hidden="true">?</span>' : `<img src="${pic}" ${shopTab === 'base' || shopTab === 'special' ? '' : `data-trim="${pic}"`} alt="">`}${corner && !hidden ? `<small>${corner}</small>` : ''}${worn ? '<b class="sg-st-worn" aria-hidden="true">✓</b>' : ''}</button>`;
+    }).join('<span class="sg-st-link" aria-hidden="true"></span>')}</div>`).join('');
+    const x = tile(pick.row, pick.level), troop = shopTab !== 'base', hid = !x.have && !x.next && !(troop && pick.level === 1 && !secret(pick.row));
+    const title = hid ? '? ? ?' : `${shopTab === 'special' ? powerName(pick.row, pick.level) : troop ? name(villain ? cartoonModel.memberOf(pick.row, pick.level) : pick.row) : t(`siegeBaseName${pick.row}` as Key)} · ${t('siegeLevel', { n: pick.level })}`;
+    const text = hid ? '' : shopTab === 'special' ? `${t(`siegePower${pick.row}Text` as Key)} · ⚡ ${cartoonModel.powerMana(pick.row, pick.level)} · ${t('siegePowerCd', { n: cartoonModel.POWERS[pick.row].cooldown })}` : troop ? `${role(pick.row, pick.level)}${mode === 'cartoon' ? needMana(M.specAt(pick.row, pick.level).cost) : ''}` : t(`siegeBaseText${pick.row}` as Key);
+    const pic = shopTab === 'special' ? powerPic(pick.row, pick.level) : shopTab === 'base' ? `/images/game/${upgradePic('cartoon', pick.row, pick.level)}.webp` : V.portrait(pick.row, pick.level);
+    const row = (label: string, value: string, n: number) => `<li><span>${label}</span><em>${value}</em><b class="sg-stars" style="--v:${n}" role="img" aria-label="${n}/5">★★★★★</b></li>`;
+    const stats = hid || shopTab === 'special' ? '' : `<ul class="sg-st-stats">${troop
+      ? stars(pick.row, pick.level).map((n, i) => row(t((['siegeStatHp', 'siegeStatDamage', 'siegeStatRate', 'siegeStatSpeed'] as const)[i]), statText(pick.row, pick.level)[i], n)).join('')
+      : baseStats(pick.row, pick.level).map(([k, v]) => row(t(k), v, pick.level)).join('')}</ul>`;
+    const price = x.have ? `✓ ${t('siegeHave')}` : x.next ? (x.price ? `🪙 ${x.price}` : t('siegeFree')) : `🔒 ${x.why}`;
+    const kind = shopTab === 'air', worn = isWorn(pick.row, pick.level);
+    // The army on a stretch of the battle bar's wall, as in battle: a tap (or a drag off the bar) takes a card out.
+    const cell = (i: number, c: number | undefined, power = false) => c === undefined ? `<span class="sg-st-cell" style="--x:${CELLS[i]}"></span>` : power ? `<button class="sg-st-cell is-full" style="--x:${CELLS[i]}" data-sg-tile="${c % 100}:${Math.floor(c / 100) + 1}" aria-label="${powerName(c % 100, Math.floor(c / 100) + 1)}"><img src="${powerPic(c % 100, Math.floor(c / 100) + 1)}" alt="" draggable="false"><small>${Math.floor(c / 100) + 1}</small></button>` : `<button class="sg-st-cell is-full" style="--x:${CELLS[i]}" data-sg-tile="${cid(c)}:${clv(c)}" aria-label="${name(cid(c))} · ${t('siegeLevel', { n: clv(c) })}"><img src="${V.portrait(cid(c), clv(c))}" data-trim="${V.portrait(cid(c), clv(c))}" alt="" draggable="false"><small>${M.specAt(cid(c), clv(c)).cost}</small></button>`;
+    const army = shopTab === 'special' ? CELLS.map((_, i) => i < cartoonModel.KIT ? cell(i, progress.kit[i], true) : `<span class="sg-st-cell is-off" style="--x:${CELLS[i]}"></span>`).join('') : CELLS.map((_, i) => cell(i, selected.filter(n => air(n) === kind)[i])).join('');
+    const armyLabel = shopTab === 'special' ? `${t('siegeShopSpecial')} ${progress.kit.length}/${cartoonModel.KIT}` : t(kind ? 'siegeArmyAir' : 'siegeArmyLand', { n: selected.filter(n => air(n) === kind).length, max: M.DECK });
+    return `<div class="sg-store is-${shopTab}"><nav class="sg-st-tabs" role="tablist">${tabs}<button class="sg-st-back" data-sg-prep="map">◀ ${t('siegeShopBack')}</button></nav>
+      <div class="sg-st-body"><div class="sg-st-frame"><div class="sg-st-grid">${grid}</div>${['top', 'bottom', 'left', 'right'].map(k => `<i class="sg-st-gem is-${k}" aria-hidden="true"></i>`).join('')}</div>
+        <aside class="sg-st-card" aria-live="polite"><div class="sg-st-head">${hid ? '<span class="sg-st-pic sg-st-q">?</span>' : `<img class="sg-st-pic" src="${pic}" ${troop && shopTab !== 'special' ? `data-trim="${pic}"` : ''} alt="">`}<h3>${title}</h3></div>${stats}
+          ${text ? `<p class="sg-st-role">${text}</p>` : ''}<p class="sg-st-price ${x.next && progress.coins < x.price ? 'is-poor' : ''}">${price}</p><p class="sg-message" role="status"></p>
+          <div class="sg-st-btns"><button class="sg-st-buy" data-sg="purchase" ${x.next && progress.coins >= x.price ? '' : 'disabled'}>${t('siegeBuy')}</button>${troop ? `<button class="sg-st-wear ${worn ? 'is-worn' : ''}" data-sg="equip" ${x.have ? '' : 'disabled'}>${t(worn ? 'siegeUnequip' : 'siegeEquip')}</button>` : ''}</div></aside></div>
+      <div class="sg-st-actions"><span class="sg-st-gold"><img src="/images/game/store/coins-2.webp" alt="">${progress.coins}</span>
+        ${troop ? `<div class="sg-st-army" data-sg-army role="group" aria-label="${armyLabel}" title="${t('siegeDragHint')}">${army}</div>` : ''}
+        <button class="sg-st-go is-fight" data-sg="launch" ${selected.length ? '' : 'disabled'}>${t('siegeLaunch')} ▶</button></div></div>`;
+  }
+  /** The base's rows in the shop: the mana pool sits by the energy, before the bow's three. */
+  const BASE_ROWS = [0, 1, 2, 6, 3, 4, 5];
+  /** What a base upgrade gives at a level, for its card: each line's label and value (its stars are the level). */
+  function baseStats(row: number, level: number): [Key, string][] {
+    const b = { quiver: 0, drawing: false, held: 0, next: 0, level, speed: level, store: level };
+    if (row === 0) return [['siegeBaseArmy', `+${level * 8}%`]];
+    if (row === 1) return [['siegeBaseFort', String(1700 + level * 200)]];
+    if (row === 2) return [['siegeBaseEnergy', `+${(level * 0.6).toFixed(1)}/s`]];
+    if (row === 6) return [['siegeBaseMana', String(200 + level * cartoonModel.MANA_STEP)]];
+    if (row === 3) return [['siegeBaseArrowDamage', String(cartoonModel.bowDamage(b))], ['siegeBaseArrows', String(cartoonModel.bowCount(b))]];
+    if (row === 4) return [['siegeBaseRate', (1 / cartoonModel.bowEvery(b)).toFixed(1)], ['siegeBaseReach', `${Math.round(cartoonModel.bowReach(b) / cartoonModel.FIELD * 100)}%`]];
+    return [['siegeBaseStore', String(Math.floor(cartoonModel.bowMax(b) / cartoonModel.BOW.cost))], ['siegeBaseRegen', (cartoonModel.bowRegen(b) / cartoonModel.BOW.cost).toFixed(1)]];
+  }
+  /** Where the army bar's six cells sit on the battle bar's art (its x on the 2047-wide sheet, less the cut at 648). */
+  const CELLS = [24, 203, 391, 570, 749, 928];
+  /** Whether a troop form (or a power's form, in Special) is in the army. */
+  const isWorn = (row: number, level: number) => (shopTab === 'special' ? progress.kit.includes(cartoonModel.powerCard(row, level)) : selected.includes(cartoonModel.card(row, level)));
+  /** A troop form's four stats as one to five stars, by halves (health, strength, attack speed, move speed), each
+      against every form of our army on a log scale, so the weakest form is one star and the best five. Strength is
+      the damage per second, a quarter more for each hundred of splash (a sniper and an Uzi compare fairly). */
+  let statRange: [number, number][] | null = null;
+  const statsOf = (sp: { hp: number; damage: number; rate: number; speed: number; splash?: number }) => [sp.hp, sp.damage / sp.rate * (1 + (sp.splash ?? 0) / 100), 1 / sp.rate, sp.speed];
+  /** The number beside each row of stars: health, damage per second, attacks per second, speed. */
+  const statText = (row: number, level: number) => statsOf(M.specAt(row, level)).map((v, i) => (i === 2 ? v.toFixed(1) : String(Math.round(v))));
+  function stars(row: number, level: number) {
+    statRange ??= [0, 1, 2, 3].map(i => { const v = M.ALLIES.flatMap(u => Array.from({ length: M.levelsOf(u.id) }, (_, k) => statsOf(M.specAt(u.id, k + 1))[i])).filter(n => n > 0 && Number.isFinite(n)); return [Math.log(Math.min(...v)), Math.log(Math.max(...v))]; });
+    return statsOf(M.specAt(row, level)).map((v, i) => { const [lo, hi] = statRange![i]; return v > 0 && Number.isFinite(v) ? Math.max(1, Math.min(5, Math.round((1 + 4 * (Math.log(v) - lo) / (hi - lo || 1)) * 2) / 2)) : 1; });
+  }
+  /** Buys the picked tile: a troop's recruit or next form, or an upgrade's next level. */
+  function purchase() {
+    const x = tile(pick.row, pick.level); if (!x.next || progress.coins < x.price) return;
+    const ok = shopTab === 'special' ? cartoonModel.buyPower(progress, pick.row) : shopTab === 'base' ? M.upgrade(progress, pick.row) : pick.level === 1 ? M.buyTroop(progress, pick.row) : M.levelUp(progress, pick.row);
+    if (ok) { const at = root.querySelector(`[data-sg-tile="${pick.row}:${pick.level}"]`)?.getBoundingClientRect(); selected = [...progress.deck]; persist(); sound('click'); if (at) flourish('levelup', 6, 700, { x: at.left + at.width / 2 - at.width, y: at.top + at.height / 2 - at.width, w: at.width * 2, h: at.width * 2 }, 'object-fit:contain;'); }
+  }
+  /** A tap on a troop form the player has puts that card in the army, or takes it out; it returns false (and says
+      so) when that kind's five places are full. */
+  function equip(row: number, level: number) {
+    if (shopTab === 'special') { if (!cartoonModel.toggleKit(progress, row, level)) return false; persist(); sound('click'); return true; }
+    const c = cartoonModel.card(row, level);
+    if (selected.includes(c)) selected = selected.filter(n => n !== c);
+    else if (selected.filter(n => air(n) === air(c)).length < M.DECK) selected.push(c);
+    else return false;
+    progress.deck = [...selected]; persist(); sound('click'); return true;
+  }
+  const won = (n: number) => progress.victories.includes(n);
+  /** What winning pays (the model's `settle`): Cartoon's acts on the nine-world scale. */
+  const prize = (n: number, first: boolean) => (mode === 'cartoon' ? cartoonModel.prize(n, first) : first ? 160 + n * 30 : 45 + n * 5);
+  function prep() {
+    // Leaving a battle under way (quitting it) drops the kept copy; with none under way (the page just loaded) it stays, to be offered.
+    if (state && !duel) dropBattle();
+    if (duel && state) { endDuel(); state = null; }
+    cancelAnimationFrame(frame); battleAbort.abort(); state = null; paused = false;
+    // The Villain campaign has its own darker songs, in its menus and its battles.
+    music(mode === 'cartoon' ? (villain ? 'villain-menu' : 'menu') : null);
+    const tabs = (mode === 'cartoon' ? ['map', 'shop'] as const : ['map', 'army', 'shop'] as const).map(k => `<button role="tab" class="${prepTab === k ? 'is-on' : ''}" aria-selected="${prepTab === k}" data-sg-prep="${k}"><img src="${mode === 'cartoon' ? (k === 'map' ? '/images/game/siege/enemy-1.webp' : k === 'army' ? V.portrait(0) : '/images/game/store/coins-2.webp') : `/images/game/${k === 'map' ? 'ui/ring_world' : k === 'army' ? 'enemies/original-bug-0' : 'store/coins-2'}.webp`}" alt="">${t(k === 'map' ? 'siegeTabMap' : k === 'army' ? 'siegeTabArmy' : mode === 'cartoon' ? 'siegeTabStore' : 'siegeTabShop')}</button>`).join('');
+    // The map: the action modes' own islands, locked ones greyed with the padlock ring, won ones with the check ring.
+    const cartoon = mode === 'cartoon';
+    // Cartoon's map is its acts, each opening on its first stage and picking its furthest open one.
+    const S = cartoonModel.STAGES, act = actNow();
+    const isles = Array.from({ length: cartoon ? cartoonModel.ACTS : lastWorld() }, (_, i) => {
+      const n = i + 1, open = (cartoon ? (n - 1) * S + 1 : n) <= progress.unlocked, on = cartoon ? n === act : n === world;
+      const pick = cartoon ? Math.min(n * S, progress.unlocked) : n, done = cartoon ? won(n * S) : won(n);
+      return `<button class="sg-isle ${on ? 'is-on' : ''} ${open ? '' : 'is-locked'}" data-sg-world-pick="${pick}" ${open ? '' : 'disabled'} aria-pressed="${on}" aria-label="${n}. ${worldName(n)}${cartoon ? ` · ${t(`siegeCtAct${n}` as Key)}` : ''}">
+        ${cartoon ? `<img src="${V.portrait(guardianOf(i))}" data-trim="${V.portrait(guardianOf(i))}" alt="">` : ''}<span class="sg-isle-n">${n}</span>
+        ${open ? done ? '<img class="sg-isle-ring" src="/images/game/ui/ring_check.webp" alt="">' : '' : '<img class="sg-isle-ring" src="/images/game/ui/ring_lock.webp" alt="">'}
+        <b>${worldName(n)}</b></button>`;
+    }).join('');
+    const map = `<div class="sg-isles" role="list">${isles}</div>
+      ${cartoon ? `<article class="sg-world is-act" style="--shade:${shade(act)}">
+        <img class="sg-world-boss" src="${V.portrait(guardianOf(act - 1))}" data-trim="${V.portrait(guardianOf(act - 1))}" alt="">
+        <span class="sg-eyebrow">${worldName(act)} · ${t('siegeStage', { n: cartoonModel.stageIn(world), max: S })}</span><h2>${t(`siegeCtAct${act}` as Key)}</h2>
+        <div class="sg-stages">${Array.from({ length: S }, (_, k) => { const n = (act - 1) * S + k + 1, open = n <= progress.unlocked; return `<button data-sg-world-pick="${n}" class="${n === world ? 'is-on' : ''} ${won(n) ? 'is-won' : ''}" ${open ? '' : 'disabled'} aria-pressed="${n === world}" aria-label="${t('siegeStage', { n: k + 1, max: S })}${k + 1 === S ? ` · ${t('siegeGuardian')}` : ''}">${k + 1 === S ? '★' : k + 1}</button>`; }).join('')}</div>
+        <p class="sg-guard">${t('siegeGuardian')} (${t('siegeStage', { n: S, max: S })}): <b>${actBoss(act)}</b></p>` : ''}
+        <p class="sg-prize"><img src="/images/game/store/coins-2.webp" alt="">${won(world) ? t('siegeRepeatWin', { n: prize(world, false) }) : t('siegeFirstWin', { n: prize(world, true) })}</p>
+        <button class="sg-play" data-sg="launch" ${selected.length ? '' : 'disabled'}><span class="sg-play-tri" aria-hidden="true"></span>${t('siegeLaunch')}</button>
+      </article>`;
+    const army = `<p class="sg-muted">${t('siegeChoose')}</p>
+      ${([false, true] as const).map(flying => `<h2 class="sg-heading">${t(flying ? 'siegeArmyAir' : 'siegeArmyLand', { n: selected.filter(id => air(id) === flying).length, max: M.DECK })}</h2><div class="sg-roster">${M.ALLIES.filter(u => !!u.air === flying).map(u => armyCard(u.id)).join('')}</div>`).join('')}
+      <p class="sg-message" role="status"></p>`;
+    const shop = mode === 'cartoon' ? cartoonShop() : `<p class="sg-muted">${t('siegeShopNote')}</p><div class="sg-upgrades">${progress.upgrades.map((level, i) => `<button data-sg-upgrade="${i}" ${level >= 5 || progress.coins < M.upgradePrice(level) ? 'disabled' : ''}>
+        <span class="sg-up-pic"><img src="/images/game/${upgradePic(mode!, i, level)}.webp" alt=""></span>
+        <span class="sg-up-text"><b>${t(`siegeUpgrade${i}` as Key)}</b><span class="sg-pips">${Array.from({ length: 5 }, (_, k) => `<i class="${k < level ? 'is-on' : ''}"></i>`).join('')}</span></span>
+        <span class="sg-up-cost">${level >= 5 ? t('siegeMax') : `<img src="/images/game/store/coins-2.webp" alt="">${M.upgradePrice(level)}`}</span></button>`).join('')}</div>
+      `;
+    // Siege Cartoon's shop is the whole screen: no header or page tabs, its own Back button.
+    if (mode === 'cartoon' && prepTab === 'map') { paint(`<div class="sg-shell sg-prep sg-map-only">${cartoonMap()}</div>`); return; }
+    if (mode === 'cartoon' && prepTab === 'shop') { paint(`<div class="sg-shell sg-prep sg-shop-only">${shop}</div>`); return; }
+    root.innerHTML = `<div class="sg-shell sg-prep"><header class="sg-top"><button class="sg-back" data-sg="modes" aria-label="${t('siegeModes')}">←</button>
+        <h1 class="sg-title">${title()}</h1>
+        <span class="sg-coins"><img src="/images/game/store/coins-2.webp" alt="">${progress.coins}</span></header>
+      <nav class="sg-ptabs" role="tablist">${tabs}</nav>
+      <section class="sg-page">${prepTab === 'map' ? map : prepTab === 'army' ? army : shop}</section>
+      <details class="sg-help"><summary>${t('siegeHow')}</summary><p>${t('siegeIntro')}</p><p>${t('siegeInstructions')}</p><p>${t('siegeKeys')}</p><p>${t('siegeRotate')}</p><p>${t('siegePreviewNote')}</p></details></div>`;
+    V.trimImages(root); focus();
+  }
+  /** Shows a Cartoon screen. The same screen again (a tap on a tile, a stage, Purchase) is updated in place, so its
+      pictures stay as they are (no flash while they load again) and its lists keep where they were scrolled to. */
+  function paint(html: string) {
+    const next = document.createElement('div'); next.innerHTML = html;
+    // Pictures already trimmed come in trimmed, so nothing jumps from its first look to the trimmed one.
+    next.querySelectorAll<HTMLImageElement>('img[data-trim]').forEach(img => { const done = cartoonView.trimmedOf(img.dataset.trim!); if (done) img.src = done; });
+    const now = root.firstElementChild, fresh = next.firstElementChild!;
+    if (now && now.className === fresh.className) morph(now, fresh);
+    else { root.replaceChildren(fresh); focus(); }
+    if (turnSeen) root.querySelector('.sg-map .sg-turn')?.remove();
+    V.trimImages(root);
+  }
+  /** Makes `from` like `to`, keeping every element that is still there (a trimmed picture keeps its trimmed source). */
+  function morph(from: Element, to: Element) {
+    for (const a of [...from.attributes]) if (!to.hasAttribute(a.name)) from.removeAttribute(a.name);
+    for (const a of [...to.attributes]) {
+      if (a.name === 'src' && from.getAttribute('data-trim') === to.getAttribute('data-trim') && from.hasAttribute('data-trim')) continue;
+      if (from.getAttribute(a.name) !== a.value) from.setAttribute(a.name, a.value);
+    }
+    const old = [...from.childNodes], neu = [...to.childNodes];
+    neu.forEach((n, i) => {
+      const o = old[i];
+      if (!o) from.append(n);
+      else if (o.nodeType === n.nodeType && (o.nodeType !== 1 || (o as Element).tagName === (n as Element).tagName)) {
+        if (o.nodeType === 1) morph(o as Element, n as Element); else if (o.textContent !== n.textContent) o.textContent = n.textContent;
+      } else o.replaceWith(n);
+    });
+    old.slice(neu.length).forEach(o => o.remove());
+  }
+  /** Cartoon's map, the owner's pictures whole (16:9, fitted in the view) with buttons on their stone platforms
+      (`MAP_SPOTS`, % of the picture): the world map's six worlds, or a world's five stages, the fifth the guardian's.
+      Around it: Back, the gold, the Shop, and on a world's map the picked stage's prize and Launch. */
+  function cartoonMap() {
+    const S = cartoonModel.STAGES, act = mapAct, pic = `/images/game/siege/map-${act ? act : 'worlds'}.webp`;
+    const spots = MAP_SPOTS[act];
+    const at = (k: number) => `style="left:${spots[k][0]}%;top:${spots[k][1]}%"`;
+    const ring = (open: boolean, done: boolean) => (!open ? '<img class="sg-spot-ring" src="/images/game/ui/ring_lock.webp" alt="">' : done ? '<img class="sg-spot-ring" src="/images/game/ui/ring_check.webp" alt="">' : '');
+    const buttons = act
+      ? Array.from({ length: S }, (_, k) => {
+        const n = (act - 1) * S + k + 1, open = n <= progress.unlocked, boss = k + 1 === S;
+        return `<button class="sg-spot ${boss ? 'is-boss' : ''} ${n === world ? 'is-on' : ''} ${open ? won(n) ? 'is-done' : '' : 'is-locked'}" ${at(k)} data-sg-world-pick="${n}" ${open ? '' : 'disabled'} aria-pressed="${n === world}" aria-label="${t('siegeStage', { n: k + 1, max: S })}${boss ? ` · ${t('siegeGuardian')}: ${actBoss(act)}` : ''}">
+          ${boss ? `<img class="sg-spot-boss" src="${V.portrait(guardianOf(act - 1))}" data-trim="${V.portrait(guardianOf(act - 1))}" alt="">` : ''}<b>${k + 1}</b>${ring(open, won(n))}</button>`;
+      }).join('')
+      : Array.from({ length: cartoonModel.ACTS }, (_, i) => {
+        const n = i + 1, open = (n - 1) * S + 1 <= progress.unlocked, on = n === actNow();
+        return `<button class="sg-spot is-world ${on ? 'is-on' : ''} ${open ? won(n * S) ? 'is-done' : '' : 'is-locked'}" ${at(i)} data-sg-map-act="${n}" ${open ? '' : 'disabled'} aria-label="${worldName(n)} · ${t(`siegeCtAct${n}` as Key)}">
+          <b>${n}</b>${ring(open, won(n * S))}<span class="sg-spot-name">${worldName(n)}</span></button>`;
+      }).join('');
+    const stage = cartoonModel.stageIn(world), here = act && actNow() === act;
+    const panel = here ? `<div class="sg-map-go">
+        <span class="sg-eyebrow">${worldName(act)} · ${t('siegeStage', { n: stage, max: S })}${stage === S ? ` · ${actBoss(act)}` : ''}</span>
+        <p class="sg-prize"><img src="/images/game/store/coins-2.webp" alt="">${won(world) ? t('siegeRepeatWin', { n: prize(world, false) }) : t('siegeFirstWin', { n: prize(world, true) })}</p>
+        ${threatLine()}
+        <button class="sg-play" data-sg="launch" ${selected.length ? '' : 'disabled'} aria-label="${t('siegeLaunch')}"><span class="sg-play-tri" aria-hidden="true"></span>${t('siegeGo')}</button></div>` : '';
+    return `<div class="sg-map" style="--map:url('${pic}')"><div class="sg-turn" role="status"><span aria-hidden="true">📱↻</span><b>${t('siegeTurn')}</b><button type="button" data-sg-turn aria-label="${t('siegeTurnOk')}">✕</button></div><div class="sg-map-pic"><img src="${pic}" alt="">${buttons}</div>
+      <header class="sg-map-top"><button class="sg-back" ${act ? 'data-sg-map-act="0"' : 'data-sg="exit"'} aria-label="${act ? t('siegeShopBack') : t('siegeExit')}">←</button>
+        <h1 class="sg-map-title">${act ? `<small>${worldName(act)}</small>${t(`siegeCtAct${act}` as Key)}` : title()}</h1>
+        ${mode === 'cartoon' ? `<button class="sg-side is-duel" data-sg="duel" aria-label="${t('siegeDuel')}">⚔️<span class="sg-side-label"> ${t('siegeDuel')}</span></button>` : ''}${mode === 'cartoon' && villainOpen() ? `<button class="sg-side ${villain ? 'is-villain' : ''}" data-sg="side" aria-pressed="${villain}" aria-label="${t(villain ? 'siegeHeroMode' : 'siegeVillainMode')}">${villain ? `🛡️<span class="sg-side-label"> ${t('siegeHeroMode')}</span>` : `😈<span class="sg-side-label"> ${t('siegeVillainMode')}</span>`}</button>` : ''}<span class="sg-coins"><img src="/images/game/store/coins-2.webp" alt="">${progress.coins}</span><button class="sg-round is-gear" data-sg="settings" aria-label="${t('options')}"><span aria-hidden="true">⚙</span></button></header>
+      <button class="sg-map-shop" data-sg-prep="shop"><span>${t('siegeTabStore')}</span></button>${panel}</div>`;
+  }
+  /** The picked stage's threat on the map: what it sends most and what answers it, red with a way to the shop when the
+      army has nothing that does. */
+  function threatLine() {
+    const threat = cartoonModel.threatOf(world); if (villain || threat === 'normal' || threat === 'mixed') return '';
+    const ready = selected.some(c => cartoonModel.counters(c, threat));
+    return `<p class="sg-threat ${ready ? '' : 'is-missing'}"><b>${THREAT_ICONS[threat]} ${t(`siegeThreat_${threat}` as Key)}</b> · ${t(`siegeThreatTip_${threat}` as Key)}${ready ? '' : ` <button type="button" class="sg-threat-fix" data-sg-prep="shop">${t('siegePrepare')}</button>`}</p>`;
+  }
+  /** The HUD's pictures of both sides: the two fortresses. */
+  // The Villain campaign's own fortress is the dark one (left), the one it attacks our castle.
+  const vsPic = (side: 0 | 1) => `/images/game/siege/${(side === 1) !== villain ? 'enemy' : 'castle'}-${side ? cartoonModel.enemyTier(world) : cartoonModel.castleTier(progress.upgrades[1])}.webp`;
+  function start(from?: Siege) {
+    cancelAnimationFrame(frame); battleAbort.abort(); battleAbort = new AbortController();
+    const battleOptions = { signal: battleAbort.signal };
+    if (!selected.length) return;
+    tilt = 0; tiltBase = null; if (!motionAsks()) askTilt();
+    // A tap anywhere in the battle (a card, the stick, the field) asks iPhones for the motion, the one time they let us.
+    for (const kind of ['touchend', 'click'] as const) root.addEventListener(kind, () => askTilt(), { ...battleOptions, capture: true });
+    progress.deck = [...selected]; persist(); mapAct = mode === 'cartoon' ? actNow() : 0;
+    // A duel: the room's maker runs it against the rival's army; the one who joined plays on what it is sent.
+    if (duel) { duel.started = true; root.classList.add('is-duel'); root.querySelector('.sg-overlay')?.remove(); }
+    state = from ?? (duel ? cartoonModel.newDuel(progress, duel.rival ?? { villain: !villain, deck: [], levels: [], upgrades: [] }, world) : M.newSiege(progress, world)); shownGold = -1; wasFull = false; for (const k in ready) delete ready[k]; lootHeard = 0;
+    // A battle carried on (`from`): what it had already said and shown is not said again.
+    bossTalked = !!from?.bossSpawned; bossHalf = !!from && from.units.some(u => u.boss && u.side && u.hp > 0 && u.hp <= u.maxHp * 0.5); baseFell = !!from && from.hp[1] <= 0; gustShown = !!from?.gusted;
+    keptAt = -1e9; if (!from) dropBattle();
+    if (mode === 'cartoon') music(from?.bossSpawned ? 'boss' : villain ? 'villain' : 'battle');
+    V.preload(world, [...selected, ...(duel?.rival?.deck ?? [])], progress.levels, villain); paused = false; camera.x = -Infinity;
+    // Laid out: mana top left, both fortresses' health face to face in the middle, coins and pause
+    // top right; the field with the bow's aim on our wall; one bar below with the magic, the troop cards and the bow.
+    root.innerHTML = `<div class="sg-battle"><header class="sg-hud">
+        <div class="sg-mana"><img src="/images/game/ui/orb.webp" alt=""><span><b data-sg-energy></b><small data-sg-status></small></span><progress data-sg-meter></progress></div>
+        <div class="sg-vs"><img class="sg-vs-pic" src="${vsPic(0)}" alt=""><span class="sg-hp"><i data-sg-bar="0"></i><small data-sg-health="0"></small></span><b>VS</b><span class="sg-hp is-enemy"><i data-sg-bar="1"></i><small data-sg-health="1"></small></span>${mode === 'cartoon' ? '<span class="sg-view" aria-hidden="true"><i data-sg-view><svg viewBox="0 0 24 14"><path d="M1 7C4 2.5 8 1 12 1s8 1.5 11 6c-3 4.5-7 6-11 6S4 11.5 1 7Z" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="7" r="3" fill="currentColor"/></svg></i></span>' : ''}<img class="sg-vs-pic" src="${vsPic(1)}" alt=""></div>
+        <div class="sg-hud-actions"><span class="sg-clock" data-sg-clock></span><span class="sg-gold"><img src="/images/game/store/coins-2.webp" alt=""><b data-sg-gold>${progress.coins}</b></span><button class="sg-pause" data-sg="pause" aria-label="${t('pause')}"><span aria-hidden="true">Ⅱ</span></button></div></header>
+      <div class="sg-field"><div class="sg-turn" role="status"><span aria-hidden="true">📱↻</span><b>${t('siegeTurn')}</b><button type="button" data-sg-turn aria-label="${t('siegeTurnOk')}">✕</button></div><canvas class="sg-arena" tabindex="0" role="img" aria-label="${t('siegeBattlefield')}"></canvas>
+      <div class="sg-aim" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="140" aria-valuemax="${mode === 'cartoon' ? cartoonModel.AIM_MAX : 1080}" aria-valuenow="700" aria-label="${t('siegeAim')}" data-sg-aim><i class="sg-aim-up" aria-hidden="true"></i><i class="sg-aim-knob" aria-hidden="true"></i><i class="sg-aim-down" aria-hidden="true"></i></div>
+      <div class="sg-camera"><button data-sg="home" aria-label="${t('siegeHome')}">◀</button><input type="range" min="0" max="1000" value="0" data-sg-camera aria-label="${t('siegeCamera')}"><button data-sg="enemy" aria-label="${t('siegeEnemy')}">▶</button></div></div>
+      <div class="sg-bar"><div class="sg-tabs" role="tablist">${(['land', 'air', 'special'] as const).map(k => `<button role="tab" data-sg-tab="${k}" aria-label="${t(k === 'land' ? 'siegeTabLand' : k === 'air' ? 'siegeTabAir' : 'siegeTabSpecial')}">${k === 'land' ? 'L' : k === 'air' ? 'A' : 'S'}</button>`).join('')}</div>
+      <div class="sg-deck" data-sg-cards></div>
+      <button data-sg="fire" class="sg-bow" aria-label="${t('siegeCannon')}"><img src="/images/game/arrows/fire.webp" alt=""><span data-sg-bow-label></span></button></div></div>`;
+    tab = 'land'; cards();
+    window.addEventListener('resize', layoutBar, battleOptions);
+    const canvas = q<HTMLCanvasElement>('canvas'); const ctx = canvas.getContext('2d')!;
+    let pointer: { id: number; start: number; camera: number; moved: boolean } | null = null;
+    canvas.addEventListener('pointerdown', e => {
+      if (paused || !state || state.phase !== 'fight') return;
+      pointer = { id: e.pointerId, start: e.clientX, camera: camera.x, moved: false }; canvas.setPointerCapture(e.pointerId);
+    }, battleOptions);
+    // The mouse wheel slides the camera over the field (sideways or up and down, as the wheel has them); in the far
+    // view, where the whole field is on screen, it walks the arrows' spot instead (up: further).
+    canvas.addEventListener('wheel', e => {
+      if (paused || !state || state.phase !== 'fight') return;
+      e.preventDefault();
+      const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      if (camera.width >= M.FIELD) { state.aim = M.aimAt(state.aim - delta * 0.6); updateUi(); }
+      else camera.x = Math.max(camera.min ?? 0, Math.min(Math.max(0, M.FIELD - camera.width), camera.x + delta * 1.5));
+    }, { ...battleOptions, passive: false });
+    canvas.addEventListener('pointermove', e => {
+      if (!pointer || e.pointerId !== pointer.id) return;
+      const delta = e.clientX - pointer.start; if (Math.abs(delta) > 6) pointer.moved = true;
+      if (pointer.moved) camera.x = Math.max(camera.min ?? 0, Math.min(M.FIELD - camera.width, pointer.camera - delta * camera.width / canvas.clientWidth));
+    }, battleOptions);
+    canvas.addEventListener('pointerup', e => {
+      if (pointer?.id !== e.pointerId) return;
+      if (!pointer.moved && state && !paused) {
+        const rect = canvas.getBoundingClientRect();
+        // Siege Cartoon: a tap on the mana monument raises the generator.
+        if (mode === 'cartoon' && cartoonView.onMana(e.clientX - rect.left, e.clientY - rect.top)) { if (raiseGenerator()) sound('click'); updateUi(); pointer = null; return; } state.aim = Math.max(120, Math.min(M.FIELD - 120, camera.x + (e.clientX - rect.left) * camera.width / rect.width - Math.max(0, (camera.width - M.FIELD) / 2)));
+      }
+      pointer = null;
+    }, battleOptions);
+    canvas.addEventListener('pointercancel', () => pointer = null, battleOptions);
+    // The aim is a stick: its knob rests in the middle; pushed up the arrows' landing spot moves
+    // away (down, nearer) as long as it is held, faster the further it is pushed, and let go the knob springs back to
+    // the middle while the landing spot stays where it was.
+    const aimPad = q<HTMLElement>('[data-sg-aim]'), knob = q<HTMLElement>('.sg-aim-knob');
+    let stick: { id: number; mid: number; half: number } | null = null;
+    const push = (y: number) => { if (!stick) return; aimPush = Math.max(-1, Math.min(1, (stick.mid - y) / stick.half)); knob.style.transform = `translateY(${(-aimPush * stick.half * 0.8).toFixed(1)}px)`; };
+    aimPad.addEventListener('pointerdown', e => {
+      e.preventDefault(); const r = aimPad.getBoundingClientRect();
+      stick = { id: e.pointerId, mid: r.top + r.height / 2, half: r.height / 2 - 14 }; aimPad.setPointerCapture(e.pointerId); aimPad.classList.add('is-held'); push(e.clientY);
+    }, battleOptions);
+    aimPad.addEventListener('pointermove', e => { if (stick?.id === e.pointerId) push(e.clientY); }, battleOptions);
+    const release = () => { stick = null; aimPush = 0; knob.style.transform = ''; aimPad.classList.remove('is-held'); };
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture'] as const) aimPad.addEventListener(type, release, battleOptions);
+    aimPad.addEventListener('keydown', e => { if (!state || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return; e.preventDefault(); e.stopPropagation(); state.aim = M.aimAt(state.aim + (e.key === 'ArrowUp' ? 40 : -40)); }, battleOptions);
+    // The bow is a switch: one tap starts the arrows, the next stops them.
+    // It answers the moment it is touched (pointerdown), so it works with another finger on the aim stick, where a
+    // second finger's tap never becomes a click; a click from the keyboard (no pointer) still works.
+    const fireButton = q<HTMLButtonElement>('[data-sg="fire"]');
+    const fire = () => { if (state && !paused && state.phase === 'fight') { M.toggleBow(state); updateUi(); } };
+    let pressedAt = -1e9;
+    fireButton.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); pressedAt = performance.now(); fire(); }, battleOptions);
+    fireButton.addEventListener('click', e => { e.stopPropagation(); if (performance.now() - pressedAt > 700) fire(); }, battleOptions);
+    last = performance.now(); accumulator = 0; uiAt = 0;
+    function loop(now: number) {
+      if (!state || finished) return;
+      const delta = Math.min(0.15, (now - last) / 1000); last = now;
+      if ((!paused || duel) && state.phase === 'fight') {
+        if (aimPush) state.aim = M.aimAt(state.aim + aimPush * Math.abs(aimPush) * AIM_SPEED * delta);
+        if (tilt && camera.width < M.FIELD) camera.x = Math.max(camera.min ?? 0, Math.min(Math.max(0, M.FIELD - camera.width), camera.x + tilt * TILT.speed * delta));
+        accumulator += delta;
+        const shot = state.shots ?? 0;
+        while (accumulator >= 1 / 30) { M.tick(state, 1 / 30); accumulator -= 1 / 30; }
+        // Each bow shot is heard (at most one sound a frame, so a fast volley stays a rattle, not a roar).
+        if ((state.shots ?? 0) > shot) sound('arrow');
+        troopSounds(now);
+        // The enemy fortress falling (its crumble, then the guardian's horn), and a coin for a fat bounty.
+        if (mode === 'cartoon' && !baseFell && state.hp[1] <= 0) { baseFell = true; sound('base-falls'); if (state.bossSpawned) music('boss'); }
+        // The corrupt wind's warning, across the top of the field for a moment.
+        if (state.gusted && !gustShown) {
+          gustShown = true; const note = document.createElement('div'); note.className = 'sg-alert'; note.setAttribute('role', 'status'); note.textContent = t('siegeGust');
+          q('.sg-field').append(note); setTimeout(() => note.remove(), 2600);
+        }
+        if (mode === 'cartoon' && (state.loot ?? 0) - lootHeard >= 8) sound('coin', 0.7);
+        lootHeard = state.loot ?? 0;
+      }
+      // Where the HUD's gold and energy counters are, for the fallen enemies' orbs.
+      if (mode === 'cartoon' && now >= uiAt) {
+        const c = canvas.getBoundingClientRect(), at = (sel: string) => { const r = root.querySelector(sel)?.getBoundingClientRect(); return r ? { x: r.left + r.width / 2 - c.left, y: r.top + r.height / 2 - c.top } : undefined; };
+        camera.goldAt = at('.sg-gold img'); camera.manaAt = at('.sg-mana img');
+      }
+      // Siege Cartoon lays its card bar over the field: the troops walk just above it.
+      // The ground line sits on the wall's top (30% down the bar's picture), so the troops walk on the grass above it.
+      // (measured with the HUD's spots, ten times a second: reading the layout every frame costs a reflow.)
+      if (mode === 'cartoon') { if (now >= uiAt) { const bar = q<HTMLElement>('.sg-bar').getBoundingClientRect(), field = canvas.getBoundingClientRect(); camera.bottom = Math.max(0, field.bottom - bar.top - bar.height * 0.3); } }
+      else camera.bottom = 0;
+      V.render(ctx, canvas, state, camera, reduced);
+      // An eye under the VS slides from its left end (the camera at our castle) to its right end (at the enemy's).
+      const look = mode === 'cartoon' ? root.querySelector<HTMLElement>('[data-sg-view]') : null;
+      if (look) { const lo = camera.min ?? 0, run = Math.max(1, M.FIELD - camera.width - lo); look.parentElement?.style.setProperty('--k', Math.max(0, Math.min(1, (camera.x - lo) / run)).toFixed(3)); }
+      // The aim control stands on the deck, wherever the field puts it.
+      q<HTMLElement>('.sg-aim').style.bottom = `calc(${((1 - (camera.deck ?? 0.5)) * 100).toFixed(1)}% + 6px)`;
+      if (now >= uiAt) { updateUi(); uiAt = now + 100; }
+      keepBattle();
+      // The duel's maker sends the battle, turned round, to the rival ten times a second.
+      if (duel?.host && now >= duel.sentAt) { duel.sentAt = now + 100; duel.link.send({ t: 'snap', s: cartoonModel.mirrorDuel(state as cartoonModel.Siege) }); }
+      // The one who joined a duel waits for its maker's word on how it ended (its own copy only fills the gaps).
+      if (duel && !duel.host && state.phase !== 'fight' && !state.paid) state.phase = 'fight';
+      if (state.phase !== 'fight' && !state.paid) { if (duel) duelOutcome(); else result(); }
+      // The guardian speaks the moment it joins, the battle held until the scene ends (Cartoon's long talk is when its stage opens; this is the short one).
+      else if (state.bossSpawned && !bossTalked && state.phase === 'fight' && !villain) {
+        bossTalked = true; paused = true; updateUi();
+        talk(cartoonStory.bossArrive(actNow()), () => { paused = false; last = performance.now(); accumulator = 0; q('canvas').focus(); });
+      }
+      // Cartoon's guardian, hurt, says a word at half its health, the battle held for it.
+      else if (mode === 'cartoon' && !villain && !bossHalf && state.phase === 'fight' && state.units.some(u => u.boss && u.side && u.hp > 0 && u.hp <= u.maxHp * 0.5)) {
+        bossHalf = true; paused = true; updateUi();
+        talk(cartoonStory.bossHalf(actNow()), () => { paused = false; last = performance.now(); accumulator = 0; q('canvas').focus(); });
+      }
+      frame = requestAnimationFrame(loop);
+    }
+    updateUi(); canvas.focus(); frame = requestAnimationFrame(loop);
+  }
+  /** Fill the bar's middle with the active tab's cards: its troops, or the special powers. */
+  function cards() {
+    root.querySelectorAll<HTMLElement>('[data-sg-tab]').forEach(b => { const on = b.dataset.sgTab === tab; b.classList.toggle('is-on', on); b.setAttribute('aria-selected', String(on)); });
+    const list = tabCards();
+    q('[data-sg-cards]').innerHTML = tab === 'special'
+      ? `<button data-sg="generator"></button><button data-sg="strike"></button>${mode === 'cartoon' ? '' : '<button data-sg="missile"></button>'}${(state?.kit ?? []).map(k => `<button data-sg-power="${k.card}"></button>`).join('')}`
+      : list.length ? list.map((id, i) => `<button data-sg-summon="${id}" aria-label="${i + 1}. ${name(cid(id))} · ${t('siegeLevel', { n: clv(id) })} · ${M.specAt(cid(id), clv(id)).cost}"><img src="${V.portrait(cid(id), clv(id))}" data-trim="${V.portrait(cid(id), clv(id))}" alt=""><small data-sg-cost="${id}"></small><i class="sg-cooldown" data-sg-cooldown="${id}"></i></button>`).join('')
+      : `<p class="sg-empty">${t('siegeAirEmpty')}</p>`;
+    V.trimImages(root); layoutBar(); updateUi();
+  }
+  /** The left edge of each of the Cartoon bar's six wall slots, in picture pixels. */
+  const SLOTS = [672, 851, 1039, 1218, 1397, 1576];
+  /** Siege Cartoon's bar is the owner's picture (see siege.css): each card is laid on one of its slots. */
+  function layoutBar() {
+    if (mode !== 'cartoon') return;
+    const bar = root.querySelector<HTMLElement>('.sg-bar'); if (!bar) return;
+    // The bar is the owner's picture whole (2047 × 398, its six wall slots from x 672): a card on each slot.
+    const u = bar.offsetHeight / 398;
+    root.querySelectorAll<HTMLElement>('.sg-bar .sg-deck button').forEach((b, i) => { b.style.left = `${((SLOTS[i] ?? SLOTS[0]) * u).toFixed(1)}px`; b.style.width = `${(152 * u).toFixed(1)}px`; });
+  }
+  function updateUi() {
+    if (!state) return; const s = state;
+    // Once the fortress falls, the enemy's bar is its guardian's.
+    const guard = s.duel ? undefined : s.units.find(u => u.boss && u.side);
+    for (const side of [0, 1]) {
+      const [hp, max] = side && guard ? [guard.hp, guard.maxHp] : [s.hp[side], s.maxHp[side]];
+      q(`[data-sg-health="${side}"]`).textContent = `${Math.ceil(Math.max(0, hp))}`;
+      q(`[data-sg-bar="${side}"]`).style.width = `${Math.max(0, hp) / max * 100}%`;
+    }
+    q('.sg-hp.is-enemy').classList.toggle('is-boss', !!guard);
+    q('[data-sg-clock]').textContent = s.duel ? clock(Math.max(0, cartoonModel.DUEL_LIMIT - s.time)) : mode === 'cartoon' && cartoonModel.prefs.untimed ? '∞' : clock(Math.max(0, M.limitOf(s.world) - s.time));
+    const gold = progress.coins + (s.loot ?? 0); if (gold > shownGold && shownGold >= 0) flourishOn(root.querySelector('.sg-gold img'), 'coin', 5, 450, 1.6); shownGold = gold;
+    q('[data-sg-gold]').textContent = `${gold}`;
+    const full = s.energy >= M.energyMax(s) - 0.01; if (full && !wasFull) flourishOn(root.querySelector('.sg-mana img'), 'energy', 5, 600, 2); wasFull = full;
+    q('[data-sg-energy]').textContent = `${Math.floor(s.energy)} / ${M.energyMax(s)}`;
+    const meter = q<HTMLProgressElement>('[data-sg-meter]'); meter.max = M.energyMax(s); meter.value = s.energy;
+    q('[data-sg-status]').textContent = `+${M.energyRate(s).toFixed(1)}/s · ${s.units.filter(u => !u.side).length}/${M.CAP}`;
+    const generator = root.querySelector<HTMLButtonElement>('[data-sg="generator"]');
+    if (generator) { setPicButton(generator, '/images/game/ui/orb.webp', s.generator >= 4 ? t('siegeMax') : `${s.generator}/4 · ${M.generatorPrice(s)}`); generator.setAttribute('aria-label', s.generator >= 4 ? t('siegeMax') : t('siegeGenerator', { n: s.generator, cost: M.generatorPrice(s) })); generator.disabled = paused || s.phase !== 'fight' || s.generator >= 4 || s.energy < M.generatorPrice(s); }
+    const bowButton = q<HTMLButtonElement>('[data-sg="fire"]');
+    const reloading = !s.bow.drawing && s.bow.quiver < M.BOW.cost;
+    q('[data-sg-bow-label]').textContent = reloading ? t('siegeBowEmpty') : t('siegeCannon');
+    // The bow button is a ball that empties as the quiver does: full colour when full, see-through when empty.
+    bowButton.style.setProperty('--q', (s.bow.quiver / ('store' in s.bow ? cartoonModel.bowMax(s.bow) : M.BOW.max)).toFixed(3));
+    bowButton.classList.toggle('is-empty', reloading); bowButton.classList.toggle('is-drawing', s.bow.drawing); bowButton.setAttribute('aria-pressed', String(s.bow.drawing));
+    bowButton.disabled = paused || s.phase !== 'fight';
+    // Specials show their recharge as a darkening that lightens from the top down.
+    const cartoon = mode === 'cartoon';
+    for (const [action, key, cd, pic, total, cost] of [['strike', 'siegeSpell', s.spell, 'skills/bolt', cartoonModel.STRIKE_EVERY, cartoon ? cartoonModel.STRIKE_COST : 0], ['missile', 'siegeMissile', s.rocket, 'fx/rocket', cartoonModel.ROCKET.every, 0]] as const) {
+      const button = root.querySelector<HTMLButtonElement>(`[data-sg="${action}"]`); if (!button) continue;
+      setPicButton(button, `/images/game/${pic}.webp`, cartoon ? (cost ? `⚡ ${cost}` : '') : cd > 0 ? `${Math.ceil(cd)}s` : t('siegeReady'), cartoon ? cd / total : 0); button.setAttribute('aria-label', t(key)); button.disabled = paused || s.phase !== 'fight' || cd > 0 || s.energy < cost; button.classList.toggle('is-cooling', cd > 0);
+    }
+    for (const k of s.kit ?? []) {
+      const button = root.querySelector<HTMLButtonElement>(`[data-sg-power="${k.card}"]`); if (!button) continue;
+      const cd = s.kitCd[k.card] ?? 0, w = cartoonModel.POWERS[k.id];
+      const mana = cartoonModel.powerMana(k.id, k.level);
+      setPicButton(button, powerPic(k.id, k.level), `${mana}`, cd / w.cooldown); button.setAttribute('aria-label', `${powerName(k.id, k.level)} · ⚡ ${mana}`); button.disabled = paused || s.phase !== 'fight' || cd > 0 || s.energy < mana; button.classList.toggle('is-cooling', cd > 0);
+    }
+    for (const id of tabCards()) {
+      const cd = s.cooldowns[id] ?? 0;
+      const card = q<HTMLButtonElement>(`[data-sg-summon="${id}"]`), can = M.canSummon(s, id); card.disabled = paused || !can; card.classList.toggle('is-cooling', cd > 0);
+      // A card that has just become ready shines once.
+      if (can && ready[id] === false && !paused) flourishOn(card, 'shine', 6, 500, 1.1); ready[id] = can;
+      { const tag = q(`[data-sg-cost="${id}"]`), cost = `${M.costOf(s, id)}`; if (tag.lastChild?.textContent !== cost) tag.innerHTML = `<i class="sg-bolt" aria-hidden="true">⚡ </i>${cost}`; }
+      const share = cd / (mode === 'cartoon' ? cartoonModel.cooldownOf(cid(id), clv(id)) : M.UNITS[cid(id)].cooldown), bar = q(`[data-sg-cooldown="${id}"]`);
+      bar.style.width = `${share * 100}%`; bar.style.setProperty('--cd', `${(share * 100).toFixed(1)}%`);
+    }
+    q('[data-sg-aim]').setAttribute('aria-valuenow', String(Math.round(M.aimAt(s.aim))));
+    q<HTMLInputElement>('[data-sg-camera]').value = String(Math.round(camera.x / Math.max(1, M.FIELD - camera.width) * 1000));
+  }
+  /** One of the owner's drawn moments played over the screen (`siege/fx/<name>-<frame>`): over `box` (screen pixels),
+      frame by frame over `ms`, then gone. Nothing plays when motion is reduced. */
+  function flourish(name: string, frames: number, ms: number, box: { x: number; y: number; w: number; h?: number }, extra = '') {
+    if (reduced || mode !== 'cartoon') return;
+    const img = document.createElement('img'); img.className = 'sg-flourish'; img.alt = ''; img.setAttribute('aria-hidden', 'true');
+    img.style.cssText = `left:${box.x}px;top:${box.y}px;width:${box.w}px;${box.h ? `height:${box.h}px;` : ''}${extra}`;
+    let f = 0; img.src = `/images/game/siege/fx/${name}-0.webp`; root.append(img);
+    const tick = setInterval(() => { if (++f >= frames) { clearInterval(tick); img.remove(); } else img.src = `/images/game/siege/fx/${name}-${f}.webp`; }, ms / frames);
+  }
+  /** `flourish` centred on an element (scaled to it). */
+  function flourishOn(el: Element | null, name: string, frames: number, ms: number, scale = 1.4) {
+    if (!el) return; const r = el.getBoundingClientRect(), w = Math.max(r.width, r.height) * scale;
+    flourish(name, frames, ms, { x: r.left + r.width / 2 - w / 2, y: r.top + r.height / 2 - w / 2, w, h: w }, 'object-fit:contain;');
+  }
+  /** The victory: fireworks bursting round the screen and confetti falling; the defeat: a shield breaking. */
+  function celebrate(won: boolean) {
+    if (reduced || mode !== 'cartoon') return;
+    const W = innerWidth, H = innerHeight, s = Math.min(W, H);
+    if (!won) { flourish('defeat', 5, 1100, { x: W / 2 - s * 0.16, y: H * 0.06, w: s * 0.32 }); return; }
+    for (let i = 0; i < 6; i++) setTimeout(() => flourish('firework', 6, 900, { x: W * (0.12 + 0.76 * ((i * 0.37) % 1)) - s * 0.12, y: H * (0.08 + 0.3 * ((i * 0.53) % 1)), w: s * 0.24 }), i * 260);
+    for (let i = 0; i < 26; i++) {
+      const c = document.createElement('img'); c.className = 'sg-confetti'; c.alt = ''; c.setAttribute('aria-hidden', 'true'); c.src = `/images/game/siege/fx/confetti-${i % 8}.webp`;
+      c.style.cssText = `left:${(i * 0.618) % 1 * 100}vw;width:${10 + (i % 3) * 4}px;animation-delay:${(i % 9) * 0.12}s;animation-duration:${2.2 + (i % 5) * 0.3}s`;
+      root.append(c); setTimeout(() => c.remove(), 4200);
+    }
+  }
+  function modal(content: string) {
+    root.querySelector('.sg-overlay')?.remove();
+    const overlay = document.createElement('div'); overlay.className = 'sg-overlay'; overlay.innerHTML = `<div class="sg-dialog" role="dialog" aria-modal="true">${content}</div>`;
+    const under = root.querySelector<HTMLElement>('.sg-battle, .sg-map-only'); if (under) under.inert = true; root.append(overlay); focus();
+  }
+  /** A story scene: the world's picture behind, the speaker's portrait on their side, a line at a
+      time. Tap or Next to go on, Skip to jump to the end; `done` runs after the last line. */
+  let story: (() => void) | null = null;
+  function talk(lines: cartoonStory.Line[], done: () => void) {
+    let at = 0;
+    root.querySelector('.sg-overlay')?.remove();
+    const overlay = document.createElement('div'); overlay.className = 'sg-overlay sg-story';
+    overlay.style.backgroundImage = mode === 'cartoon' ? `linear-gradient(#050a1466, #050a14cc), url('/images/game/${cartoonView.sceneOf(world)}.webp')` : '';
+    const battle = root.querySelector<HTMLElement>('.sg-battle'); if (battle) battle.inert = true;
+    const end = () => { story = null; overlay.remove(); if (battle) battle.inert = false; done(); };
+    const show = () => {
+      const l = lines[at], last = at === lines.length - 1;
+      // The speakers: the captain, the wizard, the joker, the king and the act's guardian.
+      const cartoon = mode === 'cartoon', wizard = 6, act = actNow(), guard = cartoonModel.GUARDIAN[act - 1];
+      const heroName = hero.name.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`), joker = 0;
+      const who = l.who === 'king' ? t(cartoon ? 'siegeCastKing' : 'siegeKing') : l.who === 'boss' ? actBoss(act) : l.who === 'hero' ? (cartoon ? t('siegeCastCaptain') : heroName) : l.who === 'wizard' ? t('siegeCastWizard') : l.who === 'joker' ? t('siegeCastJoker') : t('siegeNarrator');
+      // The King is the great samurai: the heavy armour's last form.
+      // Cartoon's cast: King Álvaro (the crowned giant) leads, Captain Jorge (the winged spearman) commands, Felipe the
+      // Wizard is the clever one and Manolo (the swordsman with the club) the funny one.
+      const pic = l.who === 'king' ? V.portrait(3, M.levelsOf(3)) : l.who === 'boss' ? V.portrait(guard) : l.who === 'hero' ? (cartoon ? V.portrait(1, 4) : hero.pic) : l.who === 'wizard' ? V.portrait(wizard, 1) : l.who === 'joker' ? V.portrait(joker, 1) : '';
+      // A heated line shows the speaker mid-action (its sheet's wind-up, blow or hurt pose).
+      const pose = 'pose' in l && l.pose && cartoon && l.who !== 'narrator' && pic.endsWith('-0.webp') ? pic.replace(/-0\.webp$/, `-${l.pose}.webp`) : pic;
+      overlay.innerHTML = `<div class="sg-scene is-${l.who} ${pose !== pic ? 'is-heated' : ''} ${pose !== pic && 'pose' in l && l.pose === 5 ? 'is-down' : ''}" role="dialog" aria-modal="true" aria-label="${t('siegeName')}">
+        <span class="sg-eyebrow">${mode === 'cartoon' ? `${worldName(actNow())} · ${t(`siegeCtAct${actNow()}` as Key)}` : t(`world${world}Name` as Key)}</span>
+        ${pic ? `<img class="sg-speaker" src="${pose}" alt="">` : ''}
+        <div class="sg-line"><b>${who}</b><p>${t(l.key)}</p>
+        <div class="sg-dialog-actions"><button class="sg-primary" data-story="next">${last ? t(state ? 'resume' : 'siegeTalkGo') : `${t('siegeTalkNext')} ▶`}</button>${last ? '' : `<button data-story="skip">${t('siegeTalkSkip')}</button>`}</div></div></div>`;
+      overlay.querySelector<HTMLElement>('[data-story="next"]')?.focus();
+    };
+    const next = () => { if (++at >= lines.length) end(); else show(); };
+    overlay.addEventListener('click', e => {
+      const b = (e.target as HTMLElement).closest<HTMLElement>('[data-story]');
+      e.stopPropagation();
+      if (b?.dataset.story === 'skip') end(); else next();
+    });
+    story = end;
+    root.append(overlay); show();
+  }
+  /** The Darkness over an act, as a CSS layer: deeper act by act. */
+  const shade = (act: number) => { const g = cartoonStory.gloom(act); return `linear-gradient(90deg, rgba(14,4,22,${(g * 0.6).toFixed(2)}), rgba(30,2,14,${g.toFixed(2)}))`; };
+  /** Siege Cartoon's act title, before its story: "Act N" and its name over the battlefield, the Darkness spreading
+      over it from the last act's to this one's. Tap or wait to go on. */
+  function actCard(act: number, done: () => void) {
+    root.querySelector('.sg-overlay')?.remove();
+    const overlay = document.createElement('div'); overlay.className = 'sg-overlay sg-story sg-actcard';
+    // Over the world's own battlefield, which shows its corruption itself (no veil spreading over it).
+    overlay.style.backgroundImage = `url('/images/game/${cartoonView.sceneOf(world)}.webp')`;
+    overlay.style.setProperty('--from', '0'); overlay.style.setProperty('--to', '0');
+    overlay.innerHTML = `<i class="sg-gloom" aria-hidden="true"></i><div class="sg-actcard-in" role="dialog" aria-modal="true" aria-label="${worldName(act)}">
+      <small>${worldName(act)}</small><h2>${t(`siegeCtAct${act}` as Key)}</h2><button class="sg-primary" data-story="next">${t('siegeTalkNext')} ▶</button></div>`;
+    let timer = 0;
+    const end = () => { clearTimeout(timer); story = null; overlay.remove(); done(); };
+    overlay.addEventListener('click', e => { e.stopPropagation(); end(); });
+    story = end; root.append(overlay); overlay.querySelector<HTMLElement>('button')?.focus();
+    timer = window.setTimeout(() => overlay.isConnected && end(), reduced ? 2500 : 4200);
+  }
+  function pause() {
+    if (!state || state.phase !== 'fight' || paused || story) return;
+    paused = true; updateUi();
+    if (mode === 'cartoon') { pauseMenu(); return; }
+    modal(`<span class="sg-eyebrow">${title()}</span><h2>${t('paused')}</h2><p>${t('siegePauseNote')}</p><div class="sg-dialog-actions"><button class="sg-primary" data-sg="resume">${t('resume')}</button><button data-sg="prep">${t('siegeLeave')}</button></div>`);
+  }
+  /** Siege Cartoon's pause, laid out like the main game's: the settings at the top left, close at the top right, then
+      Resume, Restart and Leave, in the UI kit's stone and buttons. */
+  function pauseMenu() {
+    modal(`<div class="sg-pausebox"><button class="sg-round is-gear" data-sg="settings" aria-label="${t('options')}"><span aria-hidden="true">⚙</span></button>
+      <button class="sg-round is-close" data-sg="resume" aria-label="${t('resume')}"><span aria-hidden="true">✕</span></button>
+      <h2>${t('paused')}</h2><span class="sg-eyebrow">${title()}</span>
+      <div class="sg-kit-actions"><button class="sg-kit is-green" data-sg="resume">${t('resume')}</button><button class="sg-kit is-gold" data-sg="retry">${t('restart')}</button><button class="sg-kit is-red" data-sg="prep">${t('quit')}</button></div></div>`);
+  }
+  /** The settings, from the pause: music and sound volume (the game's own, kept in its save). */
+  function settingsMenu() {
+    const [m, f] = volumes.get(), row = (k: 'music' | 'sfx', v: number) => `<label class="sg-vol"><span>${k === 'music' ? '🎵' : '🔔'} ${t(k)}</span><b>${Math.round(v * 100)}%</b><input type="range" min="0" max="100" value="${Math.round(v * 100)}" data-sg-vol="${k}"></label>`;
+    modal(`<div class="sg-pausebox"><button class="sg-round is-close" data-sg="pause-back" aria-label="${t(state ? 'paused' : 'siegeTabMap')}"><span aria-hidden="true">✕</span></button>
+      <h2>${t('options')}</h2>${row('music', m)}${row('sfx', f)}
+      <button class="sg-kit ${muted() ? 'is-gold' : 'is-blue'}" data-sg="mute" aria-pressed="${muted()}">${muted() ? '🔇 ' + t('unmute') : '🔊 ' + t('mute')}</button>
+      ${volumes.lang ? `<div class="sg-langs" role="group" aria-label="${t('language')}"><span>🌐 ${t('language')}</span>${(['es', 'en'] as const).map(l => `<button class="sg-kit ${volumes.lang!() === l ? 'is-gold' : 'is-blue'}" data-sg-lang="${l}" aria-pressed="${volumes.lang!() === l}">${l === 'es' ? 'Español' : 'English'}</button>`).join('')}</div>` : ''}
+      ${wideScreen() ? `<div class="sg-langs" role="group" aria-label="${t('siegeView')}"><span>🔭 ${t('siegeView')}</span><button class="sg-kit ${V.viewPrefs.wide ? 'is-blue' : 'is-gold'}" data-sg="view-close" aria-pressed="${!V.viewPrefs.wide}">${t('siegeViewClose')}</button><button class="sg-kit ${V.viewPrefs.wide ? 'is-gold' : 'is-blue'}" data-sg="view-wide" aria-pressed="${V.viewPrefs.wide}">${t('siegeViewWide')}</button></div>` : ''}
+      ${touchScreen() ? `<button class="sg-kit ${tiltOn() ? 'is-gold' : 'is-blue'}" data-sg="tilt" aria-pressed="${tiltOn()}">📱 ${t('siegeTilt')}: ${tiltOn() ? (tiltGranted === false ? t('siegeTiltRefused') : t('siegeOn')) : t('siegeOff')}</button>` : ''}
+      <div class="sg-toggles">${canFullscreen() ? `<button class="sg-kit ${fullscreenOn() ? 'is-gold' : 'is-blue'}" data-sg="fullscreen" aria-pressed="${fullscreenOn()}">⛶ ${t(fullscreenOn() ? 'siegeFullscreenOff' : 'siegeFullscreen')}</button>` : ''}
+      ${mode === 'cartoon' ? `<button class="sg-kit ${cartoonModel.prefs.untimed ? 'is-gold' : 'is-blue'}" data-sg="untimed" aria-pressed="${cartoonModel.prefs.untimed}">⏱ ${t('siegeUntimed')}: ${cartoonModel.prefs.untimed ? t('siegeOn') : t('siegeOff')}</button>` : ''}
+      ${state ? '' : `<button class="sg-kit ${cartoonModel.testing.free ? 'is-gold' : 'is-blue'}" data-sg="free" aria-pressed="${cartoonModel.testing.free}">${t('siegeFreeAll')}: ${cartoonModel.testing.free ? t('siegeOn') : t('siegeOff')}</button>
+      <button class="sg-kit is-red" data-sg="reset">${t('siegeReset')}</button>`}</div>
+      <div class="sg-kit-actions"><button class="sg-kit is-blue" data-sg="pause-back">← ${t(state ? 'paused' : 'siegeTabMap')}</button></div></div>`);
+    root.querySelectorAll<HTMLInputElement>('[data-sg-vol]').forEach(input => input.addEventListener('input', () => {
+      const [mm, ff] = volumes.get(), v = Number(input.value) / 100;
+      volumes.set(input.dataset.sgVol === 'music' ? v : mm, input.dataset.sgVol === 'sfx' ? v : ff);
+      const b = input.parentElement?.querySelector('b'); if (b) b.textContent = `${input.value}%`;
+    }));
+  }
+  function resume() {
+    root.querySelector('.sg-overlay')?.remove(); q('.sg-battle').inert = false; paused = false; last = performance.now(); accumulator = 0; q('canvas').focus();
+  }
+  function result() {
+    if (!state) return;
+    dropBattle();
+    const reward = M.settle(progress, state); persist(); paused = true;
+    // The guardian's fall, then (after the last one) the ending.
+    if (mode === 'cartoon' && !villain && state.phase === 'won' && cartoonModel.guarded(world)) talk(cartoonStory.bossDown(actNow()), () => (world === lastWorld() ? talk(cartoonStory.ending, () => outcome(reward)) : outcome(reward)));
+    else outcome(reward);
+  }
+  function outcome(reward: number) {
+    if (!state) return;
+    setTimeout(() => celebrate(state?.phase === 'won'), 60);
+    modal(`<span class="sg-eyebrow">${title()}</span><h2>${t(state.phase === 'won' ? 'siegeWon' : 'siegeLost')}</h2><p>${t('siegeResult', { kills: state.kills, time: clock(state.time) })}</p>${state.loot ? `<strong>${t('siegeLoot', { n: state.loot })}</strong>` : ''}${state.phase === 'won' ? `<strong>${t('siegeReward', { n: reward })}</strong>${world === lastWorld() ? `<p>${t(mode === 'cartoon' ? 'siegeCartoonComplete' : 'siegeComplete')}</p>` : ''}` : `<p>${t('siegeRetryHint')}</p>`}<div class="sg-dialog-actions">${state.phase === 'won' && world < lastWorld() ? `<button class="sg-primary" data-sg="next">${t('siegeNext')}</button>` : `<button class="sg-primary" data-sg="retry">${t('again')}</button>`}<button data-sg="prep">${t('siegeLeave')}</button></div>`);
+  }
+  /** The shop tile tapped last and when, to tell a double tap. */
+  let lastTile = { key: '', at: -1e9 };
+  /** The map stage tapped last and when, to tell a double tap (it starts that battle). */
+  let lastPick = { n: -1, at: -1e9 };
+  /** Starts the picked stage's battle, after its act card and story when it has them. */
+  function launch() { if (villain) { start(); return; } cartoonModel.stageIn(world) === 1 ? actCard(actNow(), () => talk(cartoonStory.intro(actNow()), start)) : cartoonModel.guarded(world) ? talk(cartoonStory.bossTalk(actNow()), start) : start(); }
+  /** Redraws the preparation screen keeping the shop grid's scroll, then focuses `focus` (without scrolling). */
+  function redraw(focus: string) {
+    const g = root.querySelector('.sg-st-grid')?.scrollTop ?? 0; prep();
+    const grid = root.querySelector('.sg-st-grid'); if (grid) grid.scrollTop = g;
+    root.querySelector<HTMLElement>(focus)?.focus({ preventScroll: true });
+  }
+  /** The shop's drag and drop: a form the player owns dragged from the grid onto the army bar joins the army, a card
+      dragged off the bar leaves it. A mouse drags as soon as it moves; a finger after a short hold, so a swipe still
+      scrolls the grid. */
+  let drag: { key: string; fromBar: boolean; x: number; y: number; id: number; ghost?: HTMLElement; hold?: number } | null = null;
+  let droppedAt = -1e9;
+  const overBar = (x: number, y: number) => !!document.elementFromPoint(x, y)?.closest('.sg-st-army');
+  /** The army bar's cell under a point (a card, or an empty place), if any. */
+  const cellAt = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>('.sg-st-army .sg-st-cell:not(.is-off)') ?? null;
+  /** Moves a card in the army bar: dropped on another card, the two swap places; on an empty place, it goes last. */
+  function reorder(key: string, to: string | undefined) {
+    const [row, level] = key.split(':').map(Number), special = shopTab === 'special';
+    const code = (k: string) => { const [r, l] = k.split(':').map(Number); return special ? cartoonModel.powerCard(r, l) : cartoonModel.card(r, l); };
+    const list = special ? progress.kit : selected, a = list.indexOf(code(key)); if (a < 0) return;
+    if (to) { const b = list.indexOf(code(to)); if (b < 0) return; [list[a], list[b]] = [list[b], list[a]]; }
+    else list.push(...list.splice(a, 1));
+    if (!special) progress.deck = [...selected];
+    pick = { row, level }; persist(); sound('click');
+  }
+  function lift(from: HTMLElement) {
+    if (!drag) return; const img = from.querySelector('img'); if (!img) { drag = null; return; }
+    const ghost = img.cloneNode() as HTMLElement; const r = from.getBoundingClientRect();
+    ghost.className = 'sg-st-ghost'; ghost.style.width = `${Math.round(r.width)}px`; ghost.style.height = `${Math.round(r.height)}px`;
+    ghost.style.left = `${drag.x - r.width / 2}px`; ghost.style.top = `${drag.y - r.height / 2}px`;
+    root.append(ghost); drag.ghost = ghost; root.classList.add('is-dragging'); navigator.vibrate?.(12);
+  }
+  function endDrag() { if (!drag) return; clearTimeout(drag.hold); drag.ghost?.remove(); root.classList.remove('is-dragging'); root.querySelector('.sg-st-army')?.classList.remove('is-over'); root.querySelectorAll('.sg-st-cell.is-target').forEach(c => c.classList.remove('is-target')); drag = null; }
+  root.addEventListener('pointerdown', event => {
+    endDrag(); if (state || shopTab === 'base' || event.button > 0) return;
+    const from = (event.target as HTMLElement).closest<HTMLElement>('.sg-st-tile, .sg-st-cell.is-full'); if (!from?.dataset.sgTile) return;
+    const [row, level] = from.dataset.sgTile.split(':').map(Number), fromBar = from.classList.contains('sg-st-cell');
+    if (!fromBar && !tile(row, level).have) return;
+    drag = { key: from.dataset.sgTile, fromBar, x: event.clientX, y: event.clientY, id: event.pointerId };
+    if (event.pointerType !== 'mouse') drag.hold = window.setTimeout(() => lift(from), 260);
+  }, options);
+  window.addEventListener('pointermove', event => {
+    if (!drag || event.pointerId !== drag.id) return;
+    const far = Math.hypot(event.clientX - drag.x, event.clientY - drag.y);
+    if (!drag.ghost) {
+      if (event.pointerType !== 'mouse') { if (far > 10) endDrag(); return; }
+      if (far < 6) return; const from = root.querySelector<HTMLElement>(`${drag.fromBar ? '.sg-st-army' : '.sg-st-grid'} [data-sg-tile="${drag.key}"]`); if (!from) { endDrag(); return; } lift(from);
+    }
+    if (!drag?.ghost) return;
+    const w = drag.ghost.offsetWidth, h = drag.ghost.offsetHeight;
+    drag.ghost.style.left = `${event.clientX - w / 2}px`; drag.ghost.style.top = `${event.clientY - h / 2}px`;
+    root.querySelector('.sg-st-army')?.classList.toggle('is-over', overBar(event.clientX, event.clientY));
+    const onto = drag.fromBar ? cellAt(event.clientX, event.clientY) : null;
+    root.querySelectorAll('.sg-st-cell.is-target').forEach(c => c !== onto && c.classList.remove('is-target')); if (onto && onto.dataset.sgTile !== drag.key) onto.classList.add('is-target');
+  }, options);
+  // While a finger drags a card the page must not scroll (the hold already started it, so the browser has not panned yet).
+  root.addEventListener('touchmove', event => { if (drag?.ghost) event.preventDefault(); }, { ...options, passive: false });
+  root.addEventListener('contextmenu', event => { if ((event.target as HTMLElement).closest('.sg-st-tile, .sg-st-cell')) event.preventDefault(); }, options);
+  window.addEventListener('pointerup', event => {
+    if (!drag || event.pointerId !== drag.id) return;
+    if (!drag.ghost) { endDrag(); return; }
+    const { key, fromBar } = drag, [row, level] = key.split(':').map(Number), on = overBar(event.clientX, event.clientY);
+    const onto = cellAt(event.clientX, event.clientY);
+    endDrag(); droppedAt = event.timeStamp;
+    if (fromBar && on) { if (onto && onto.dataset.sgTile !== key) { reorder(key, onto.dataset.sgTile); redraw(`.sg-st-army [data-sg-tile="${key}"]`); } return; }
+    if (fromBar === on) return;
+    pick = { row, level }; const full = isWorn(row, level) === on ? false : !equip(row, level);
+    redraw(`.sg-st-grid [data-sg-tile="${key}"]`); if (full) q('.sg-message').textContent = t(shopTab === 'special' ? 'siegePowerKitFull' : 'siegeFull');
+  }, options);
+  window.addEventListener('pointercancel', endDrag, options);
+  // In battle a second finger must work while the first holds the aim stick or the bow: a phone sends no click for a
+  // tap made while another finger is down, so a touch on the bottom bar's buttons acts on its own touch-down then, and the
+  // click that may still follow is dropped.
+  const touches = new Set<number>(); let pressed: { button: HTMLButtonElement; at: number } | null = null;
+  root.addEventListener('pointerdown', event => {
+    const others = touches.size; if (event.pointerType !== 'mouse') touches.add(event.pointerId);
+    if (!state || event.pointerType === 'mouse' || !others) return;
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('.sg-bar button'); if (!button || button.disabled || button.dataset.sg === 'fire') return;
+    pressed = { button, at: event.timeStamp }; button.click();
+  }, { ...options, capture: true });
+  for (const type of ['pointerup', 'pointercancel'] as const) window.addEventListener(type, event => touches.delete(event.pointerId), { ...options, capture: true });
+  // A press on any of Cartoon's buttons sends out a soft gold ring from the finger.
+  root.addEventListener('pointerdown', event => {
+    const b = (event.target as Element | null)?.closest('.sg-kit, .sg-round, [data-sg-summon], [data-sg-power], .sg-st-tile, [data-sg-prep], .sg-bow');
+    if (b && !(b as HTMLButtonElement).disabled) flourish('ring', 4, 320, { x: event.clientX - 28, y: event.clientY - 28, w: 56, h: 56 });
+  }, { passive: true });
+  root.addEventListener('click', event => {
+    if (event.timeStamp - droppedAt < 400) return;
+    // The real click after a bar button already pressed by its touch-down (see above).
+    if (event.isTrusted && pressed && event.timeStamp - pressed.at < 800 && (event.target as HTMLElement).closest('button') === pressed.button) { pressed = null; return; }
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button'); if (!button || button.disabled) return;
+    const { sg: action, sgUnit: unit, sgUpgrade: up, sgSummon: summonId } = button.dataset;
+    if (unit !== undefined && !state) {
+      const id = Number(unit); if (selected.includes(id)) selected = selected.filter(n => n !== id);
+      else if (selected.filter(n => air(n) === air(id)).length < M.DECK) selected.push(id);
+      else { q('.sg-message').textContent = t('siegeFull'); return; }
+      prep(); root.querySelector<HTMLElement>(`[data-sg-unit="${id}"]`)?.focus(); return;
+    }
+    if (button.dataset.sgShopTab && !state) { shopTab = button.dataset.sgShopTab as typeof shopTab; pick = { row: shopRows()[0], level: 1 }; prep(); root.querySelector<HTMLElement>(`[data-sg-shop-tab="${shopTab}"]`)?.focus(); return; }
+    if (button.dataset.sgTile && !state) {
+      const [row, level] = button.dataset.sgTile.split(':').map(Number);
+      // A double tap on a tile that can be bought buys it, on one owned puts it in (or takes it out of) the army (the
+      // screen is redrawn between the taps, so no `dblclick`); a single tap shows the tile's card on the right.
+      const again = lastTile.key === button.dataset.sgTile && event.timeStamp - lastTile.at < 450; lastTile = { key: button.dataset.sgTile, at: again ? -1e9 : event.timeStamp };
+      const cell = !!button.closest('.sg-st-army');
+      if (again && !cell && tile(row, level).next) { pick = { row, level }; purchase(); redraw(`.sg-st-grid [data-sg-tile="${row}:${level}"]`); return; }
+      pick = { row, level }; let full = false; if (cell || (again && shopTab !== 'base' && tile(row, level).have)) full = !equip(row, level);
+      redraw(`.sg-st-grid [data-sg-tile="${row}:${level}"]`); if (full) q('.sg-message').textContent = t(shopTab === 'special' ? 'siegePowerKitFull' : 'siegeFull'); return; }
+    if (action === 'equip' && !state) { const full = !equip(pick.row, pick.level); redraw('[data-sg="equip"]'); if (full) q('.sg-message').textContent = t(shopTab === 'special' ? 'siegePowerKitFull' : 'siegeFull'); return; }
+    if (action === 'purchase' && !state) { purchase(); redraw('[data-sg="purchase"]:not(:disabled), [data-sg="equip"]'); return; }
+    if (button.dataset.sgBuy !== undefined && !state) {
+      const id = Number(button.dataset.sgBuy);
+      if (M.buyTroop(progress, id)) { persist(); selected = [...progress.deck]; prep(); root.querySelector<HTMLElement>(`[data-sg-unit="${id}"]`)?.focus(); }
+      else q('.sg-message').textContent = t('siegeNoGold');
+      return;
+    }
+    if (button.dataset.sgPrep && !state) { prepTab = button.dataset.sgPrep as typeof prepTab; prep(); root.querySelector<HTMLElement>(`[data-sg-prep="${prepTab}"]`)?.focus(); return; }
+    if (button.dataset.sgMapAct !== undefined && !state) {
+      mapAct = Number(button.dataset.sgMapAct);
+      // A world opens on its furthest open stage (the one picked, if it is in that world).
+      if (mapAct && actNow() !== mapAct) world = Math.min(mapAct * cartoonModel.STAGES, progress.unlocked);
+      sound('click'); prep(); return;
+    }
+    if (button.dataset.sgWorldPick && !state) {
+      // A second tap on the same stage (not an island) goes straight into its battle, as Start would.
+      const n = Number(button.dataset.sgWorldPick), twice = !button.classList.contains('sg-isle') && lastPick.n === n && event.timeStamp - lastPick.at < 450;
+      lastPick = { n, at: twice ? -1e9 : event.timeStamp };
+      if (twice && n === world) { launch(); return; }
+      world = n; const left = root.querySelector('.sg-isles')?.scrollLeft ?? 0; prep(); const isles = root.querySelector('.sg-isles'); if (isles) isles.scrollLeft = left; root.querySelector<HTMLElement>(`[data-sg-world-pick="${world}"]`)?.focus(); return; }
+    if (up !== undefined && !state) { if (M.upgrade(progress, Number(up))) { persist(); prep(); } return; }
+    if (button.dataset.sgLang && volumes.setLang) { t = volumes.setLang(button.dataset.sgLang as 'es' | 'en'); settingsMenu(); return; }
+    if (button.hasAttribute('data-sg-turn')) { turnSeen = true; button.parentElement?.remove(); return; }
+    if (button.dataset.sgTab && state) { tab = button.dataset.sgTab as typeof tab; cards(); return; }
+    if (summonId !== undefined && state && (!paused || duel)) { if (summonCard(Number(summonId))) sound('click'); updateUi(); return; }
+    if (action === 'exit') close();
+    else if (action === 'launch') launch();
+    else if (action === 'modes') modes();
+    else if (action === 'retry') start();
+    else if (action === 'prep') prep();
+    else if (action === 'next') { world = Math.min(lastWorld(), world + 1); prep(); }
+    else if (action === 'pause') pause();
+    else if (action === 'settings') settingsMenu();
+    else if (action === 'side' && !state) { switchSide(); sound('click'); }
+    else if (action === 'duel' && !state) duelMenu();
+    else if (action === 'duel-side' && !state && !duel) { useSide(button.dataset.sgV === '1'); duelMenu(); }
+    else if (action === 'duel-host' && !state && !duel) { duel = { link: openDuel(null, duelHandlers(true)), host: true, sentAt: 0 }; duelStatus(t('siegeDuelConnecting')); }
+    else if (action === 'duel-join' && !state && !duel) { const code = (root.querySelector<HTMLInputElement>('[data-sg-duel-code]')?.value ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4); if (code.length < 4) { duelStatus(t('siegeDuelCode')); return; } duel = { link: openDuel(code, duelHandlers(false)), host: false, sentAt: 0 }; duelStatus(t('siegeDuelConnecting')); }
+    else if (action === 'duel-cancel') { endDuel(); prep(); }
+    else if (action === 'pause-back') { if (state) pauseMenu(); else { root.querySelector('.sg-overlay')?.remove(); prep(); } }
+    else if (action === 'tilt') { storage.set(TILT_KEY, tiltOn() ? '0' : ''); tilt = 0; tiltBase = null; if (tiltOn()) { tiltGranted = tiltGranted === false ? null : tiltGranted; askTilt(); } settingsMenu(); }
+    else if (action === 'mute') { if (muted()) volumes.set(lastHeard[0] || 0.6, lastHeard[1] || 0.8); else { lastHeard = volumes.get(); volumes.set(0, 0); } settingsMenu(); }
+    else if (action === 'view-close' || action === 'view-wide') { V.viewPrefs.wide = action === 'view-wide'; storage.set(WIDE_KEY, V.viewPrefs.wide ? '1' : ''); settingsMenu(); }
+    else if (action === 'fullscreen') { (fullscreenOn() ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(() => {}).then(() => settingsMenu()); }
+    else if (action === 'untimed') { cartoonModel.prefs.untimed = !cartoonModel.prefs.untimed; storage.set(UNTIMED_KEY, cartoonModel.prefs.untimed ? '1' : ''); updateUi(); settingsMenu(); }
+    else if (action === 'free') { cartoonModel.testing.free = !cartoonModel.testing.free; storage.set(FREE_KEY, cartoonModel.testing.free ? '1' : ''); settingsMenu(); }
+    else if (action === 'reset') {
+      modal(`<div class="sg-pausebox"><h2>${t('siegeReset')}</h2><p>${t('siegeResetAsk')}</p><div class="sg-kit-actions"><button class="sg-kit is-red" data-sg="reset-yes">${t('siegeReset')}</button><button class="sg-kit is-blue" data-sg="settings">${t('siegeCancel')}</button></div></div>`);
+    } else if (action === 'reset-yes') { storage.set(M.SAVE_KEY, JSON.stringify(cartoonModel.freshProgress())); root.querySelector('.sg-overlay')?.remove(); choose('cartoon'); }
+    else if (action === 'resume') resume();
+    else if (action === 'resume-battle' && !state) resumeBattle();
+    else if (action === 'resume-drop' && !state) { dropBattle(); root.querySelector('.sg-overlay')?.remove(); prep(); }
+    else if (action === 'home') camera.x = -Infinity;
+    else if (action === 'enemy') camera.x = Math.max(0, M.FIELD - camera.width);
+    else if (state && !paused && button.dataset.sgPower !== undefined) { const id = Number(button.dataset.sgPower); if (cartoonModel.castPower(state as cartoonModel.Siege, id)) sound(id === 0 ? 'bow' : id === 2 ? 'boom' : 'strike'); updateUi(); }
+    else if (state && !paused) { if (action === 'generator') raiseGenerator(); if (action === 'strike' && M.strike(state)) sound('strike'); if (action === 'missile' && M.missile(state)) sound('boom'); updateUi(); }
+  }, options);
+  root.addEventListener('input', event => {
+    const el = event.target as HTMLInputElement;
+    if (el.hasAttribute('data-sg-camera')) camera.x = Math.max(0, M.FIELD - camera.width) * Number(el.value) / 1000;
+  }, options);
+  // Capture keyboard input so page-level hotkeys never run behind this modal.
+  const keyHandler = (e: KeyboardEvent) => {
+    e.stopImmediatePropagation();
+    if (e.key === 'Tab') {
+      const scope = root.querySelector('.sg-overlay') ?? root;
+      const items = [...scope.querySelectorAll<HTMLElement>('button:not(:disabled), select, input, canvas[tabindex], summary')];
+      const first = items[0], end = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); end?.focus(); }
+      else if (!e.shiftKey && document.activeElement === end) { e.preventDefault(); first?.focus(); }
+      return;
+    }
+    if (story) { if (e.key === 'Escape') { e.preventDefault(); story(); } return; }
+    if (e.key === 'Escape') { e.preventDefault(); if (!state) mode === 'cartoon' && prepTab === 'shop' ? (prepTab = 'map', prep()) : mode === 'cartoon' && mapAct ? (mapAct = 0, prep()) : close(); else if (state.phase === 'fight') paused ? resume() : pause(); return; }
+    if (!state || paused || /INPUT|SELECT|TEXTAREA/.test((e.target as HTMLElement).tagName)) return;
+    const key = e.key.toLowerCase();
+    if ('123456efqrlas '.includes(key) || key.startsWith('arrow')) e.preventDefault();
+    // Held keys repeat only for the aim (up and down walk the arrows' spot).
+    if (key === 'arrowup' || key === 'arrowdown') { state.aim = M.aimAt(state.aim + (key === 'arrowup' ? 40 : -40)); updateUi(); return; }
+    if (e.repeat) return;
+    if (key === 'l' || key === 'a' || key === 's') { tab = key === 'l' ? 'land' : key === 'a' ? 'air' : 'special'; cards(); return; }
+    if (/^[1-6]$/.test(key)) { const n = Number(key) - 1; if (tab === 'special') [() => M.improveGenerator(state!), () => M.strike(state!), ...(mode === 'cartoon' ? [] : [() => M.missile(state!)])][n]?.(); else { const id = tabCards()[n]; if (id !== undefined) M.summon(state, id); } }
+    else if (key === 'r') M.missile(state);
+    else if (key === 'e') raiseGenerator(); else if (key === 'f' || key === ' ') M.toggleBow(state); else if (key === 'q') M.strike(state);
+    else if (key === 'arrowleft') camera.x = Math.max(camera.min ?? 0, camera.x - 100); else if (key === 'arrowright') camera.x = Math.min(Math.max(0, M.FIELD - camera.width), camera.x + 100);
+    updateUi();
+  };
+  window.addEventListener('keydown', keyHandler, { ...options, capture: true });
+  window.addEventListener('keyup', e => e.stopImmediatePropagation(), { ...options, capture: true });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { keepBattle(true); pause(); } }, options);
+  window.addEventListener('pagehide', () => keepBattle(true), options);
+  window.addEventListener('blur', () => { keepBattle(true); pause(); }, options);
+  /** The first screen: the world map. */
+  function modes() { choose('cartoon'); }
+  /** Every map picture and the stall loaded once, so moving between maps never shows one half-loaded. */
+  const mapPics = ['worlds', 1, 2, 3, 4, 5, 6].map(n => Object.assign(new Image(), { src: `/images/game/siege/map-${n}.webp` }));
+  void mapPics; void Object.assign(new Image(), { src: '/images/game/siege/ui/shop-stall.webp' });
+  function choose(next: Mode) {
+    mode = next; ({ m: M, v: V } = ENGINES[next]); villain = false; root.classList.remove('is-villain');
+    root.classList.toggle('is-cartoon', next === 'cartoon');
+    progress = M.readProgress(storage.get(M.SAVE_KEY)); selected = [...progress.deck]; world = progress.unlocked; prepTab = 'map'; mapAct = 0;
+    prep();
+    if (next === 'cartoon') offerResume();
+  }
+  modes();
+}
