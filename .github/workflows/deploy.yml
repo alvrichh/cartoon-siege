@@ -1,0 +1,26 @@
+# Render is not connected to this GitHub account, so each push to main calls the service's deploy hook instead.
+# The hook's URL lives in the repository secret RENDER_DEPLOY_HOOK (Render → cartoon-siege → Settings → Deploy Hook).
+name: Deploy to Render
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Trigger the Render deploy
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then echo "RENDER_DEPLOY_HOOK is not set; skipping the deploy."; exit 0; fi
+          curl -fsS -X POST "$HOOK" > /dev/null && echo "Render deploy started."
