@@ -31,7 +31,6 @@ button{font:inherit;cursor:pointer;touch-action:manipulation}
 .cs-troops li{flex:1 1 0;min-width:0;display:flex;justify-content:center}
 .cs-troops img{height:clamp(70px,16vw,170px);width:auto;object-fit:contain;filter:drop-shadow(0 6px 6px #000a);animation:cs-bob 2.4s ease-in-out infinite}
 .cs-troops li:nth-child(2) img{animation-delay:-.6s}.cs-troops li:nth-child(3) img{animation-delay:-1.2s}.cs-troops li:nth-child(4) img{animation-delay:-1.8s}
-.cs-troops .is-foe img{transform:scaleX(-1)}
 @keyframes cs-bob{50%{translate:0 -6px}}
 
 .cs-section{max-width:1080px;margin:0 auto;padding:32px 16px 56px}
