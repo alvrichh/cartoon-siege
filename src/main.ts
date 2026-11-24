@@ -6,6 +6,9 @@ import { audio, SIEGE_SOUNDS, type SiegeSound, type Sfx } from './audio';
 import { makeT, pickLang, type Lang, type T } from './strings';
 import { storage } from './lib/storage';
 import { LANDING } from './landing';
+import { importFromAddress } from './import';
+
+importFromAddress();
 
 const SETTINGS = 'cartoonSiege.settings';
 const LANG = 'cartoonSiege.lang';
