@@ -17,12 +17,17 @@ button{font:inherit;cursor:pointer;touch-action:manipulation}
 .cs-lang button[aria-pressed="true"]{background:var(--gold);color:var(--ink)}
 
 .cs-hero{position:relative;min-height:min(100svh,820px);display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:96px 16px 0;overflow:hidden;
-  background:linear-gradient(180deg,#15102166 0%,#1510211a 40%,#151021 100%),url(/images/game/siege/map-worlds.webp) center/cover no-repeat}
+  background:linear-gradient(180deg,#15102140 0%,#15102100 35%,#15102100 75%,#151021 100%),url(/images/cover-landscape.webp) center/cover no-repeat}
+.cs-hero{justify-content:flex-start;padding-top:max(72px,7svh)}
+.cs-hero .cs-troops{display:none}
+.cs-hero-inner{display:flex;flex-direction:column;align-items:center;min-height:calc(min(100svh,820px) - max(72px,7svh) - 28px)}
+.cs-hero-inner .cs-play{margin-top:auto}
+.cs-logo img{width:min(400px,60vw,40svh)}
 .cs-hero-inner{position:relative;z-index:1;max-width:760px}
 .cs-logo{margin:0;font:900 clamp(52px,12vw,124px)/.9 "Arial Black",Impact,system-ui,sans-serif;letter-spacing:-.01em;color:var(--paper);text-transform:uppercase;
   -webkit-text-stroke:clamp(2px,.6vw,5px) var(--ink);paint-order:stroke fill;text-shadow:0 clamp(4px,1vw,9px) 0 var(--ink)}
 .cs-logo span{display:block;color:var(--gold);transform:rotate(-2deg)}
-.cs-logo img{display:block;width:min(460px,80vw,46svh);height:auto;margin:0 auto;filter:drop-shadow(0 10px 18px #000a)}
+.cs-logo img{display:block;height:auto;margin:0 auto;filter:drop-shadow(0 10px 18px #000a)}
 .cs-tagline{margin:18px auto 26px;font-size:clamp(18px,2.6vw,24px);font-weight:800;color:#fff;text-shadow:0 2px 0 var(--ink),0 0 18px #000c}
 .cs-play{border:3px solid var(--ink);border-radius:18px;background:linear-gradient(#ffe07a,var(--gold) 55%,var(--gold-dark));color:var(--ink);font-weight:900;font-size:clamp(20px,3vw,26px);text-transform:uppercase;letter-spacing:.04em;padding:14px 40px;min-height:60px;box-shadow:0 6px 0 var(--ink);transition:transform .08s,box-shadow .08s}
 .cs-play:hover{transform:translateY(-2px);box-shadow:0 8px 0 var(--ink)}
@@ -67,4 +72,14 @@ button{font:inherit;cursor:pointer;touch-action:manipulation}
   .cs-hero-inner{display:flex;flex-direction:column;align-items:center;min-height:calc(100svh - max(96px,14svh) - 24px)}
   .cs-play{margin-top:auto}
   .cs-free{margin-bottom:8px}
+}
+
+/* Phones held sideways (short screens): a smaller logo, no tagline, the Play button inside the view. */
+@media (max-height:500px){
+  .cs-hero{padding-top:56px}
+  .cs-hero-inner{min-height:calc(100svh - 56px - 16px)}
+  .cs-logo img{width:min(220px,38svh*1.4)}
+  .cs-tagline{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  .cs-play{min-height:48px;padding:8px 32px;font-size:20px}
+  .cs-free{margin-top:6px;font-size:12px}
 }
